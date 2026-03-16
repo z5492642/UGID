@@ -1,0 +1,455 @@
+import time
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import scipy.optimize as opt
+import warnings
+from sklearn.model_selection import KFold
+from sklearn.metrics import mean_squared_error, r2_score
+
+!pip install pymoo
+
+from pymoo.problems.functional import FunctionalProblem
+from pymoo.algorithms.moo.nsga2 import NSGA2
+from pymoo.termination import get_termination
+from pymoo.optimize import minimize as pymoo_minimize
+from pymoo.core.population import Population
+from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
+
+warnings.filterwarnings('ignore')
+
+start_time = time.time()
+
+# ============================================================
+# 1) Ground truth and synthetic data
+# ============================================================
+
+def ground_truth_function_2d(x):
+    x1, x2 = x
+    return np.sin(2.0 * np.pi * x1) * np.cos(2.0 * np.pi * x2) + 1.5
+
+def generate_synthetic_data_2d(n_points=30, noise_std=0.05, seed=123):
+    np.random.seed(seed)
+    X = np.random.rand(n_points, 2)
+    y_clean = np.array([ground_truth_function_2d(xi) for xi in X])
+    noise = noise_std * np.random.randn(n_points)
+    y_noisy = y_clean + noise
+    return X, y_noisy
+
+# ============================================================
+# 2) Kernel and GP functions
+# ============================================================
+
+def kernel(x1, x2, var_f, lengthscales):
+    if x1.ndim == 1:
+        x1 = x1.reshape(1, -1)
+    if x2.ndim == 1:
+        x2 = x2.reshape(1, -1)
+
+    diff = (x1[:, np.newaxis, :] - x2[np.newaxis, :, :]) ** 2
+    lengthscales = np.array(lengthscales)
+    scaled_diff = diff / (2 * lengthscales**2)
+    pairwise_distances = np.sum(scaled_diff, axis=-1)
+
+    return var_f * np.exp(-pairwise_distances)
+
+def gp_regression_noisy(X, y, k, x_star, var_f, var_n, l):
+    if x_star.ndim == 1:
+        x_star = x_star.reshape(1, -1)
+
+    Kxx = k(X, X, var_f, l) + var_n * np.eye(X.shape[0])
+    Lxx = np.linalg.cholesky(Kxx)
+    a = np.linalg.solve(Lxx.T, np.linalg.solve(Lxx, y))
+
+    Kxs = k(X, x_star, var_f, l)
+    mu = Kxs.T @ a
+
+    v = np.linalg.solve(Lxx, Kxs)
+    Kss = k(x_star, x_star, var_f, l)
+    var = Kss - v.T @ v
+
+    return mu, var
+
+def f_opt(params, *args):
+    X, y, k = args
+    var_f = params[0]
+    var_n = params[-1]
+    lengthscales = params[1:-1]
+
+    Kxx = k(X, X, var_f, lengthscales) + var_n * np.eye(X.shape[0])
+    Lxx = np.linalg.cholesky(Kxx)
+    a = np.linalg.solve(Lxx.T, np.linalg.solve(Lxx, y))
+
+    n = X.shape[0]
+    logdetK = 2.0 * np.sum(np.log(np.diag(Lxx)))
+    return 0.5 * y.T @ a + 0.5 * logdetK + 0.5 * n * np.log(2.0 * np.pi)
+
+def fit_gp_hyperparams(X_sample, Y_sample, kernel_func):
+    x0 = [1.0, 0.3, 0.3, 0.01]
+    bounds = [(1e-3, None), (1e-3, 1.0), (1e-3, 1.0), (1e-5, None)]
+    args = (X_sample, Y_sample, kernel_func)
+    res = opt.fmin_l_bfgs_b(f_opt, x0, args=args, approx_grad=True, bounds=bounds)
+
+    var_f = res[0][0]
+    var_n = res[0][-1]
+    l = res[0][1:-1]
+    nlml = res[1]
+    return var_f, l, var_n, nlml
+
+# ============================================================
+# 3) Diagnostics functions
+# ============================================================
+
+def compute_train_diagnostics(X_train, y_train, kernel_func, var_f, var_n, l):
+    preds = []
+    sds = []
+
+    for x in X_train:
+        mu, var = gp_regression_noisy(
+            X_train, y_train, kernel_func,
+            np.array([x]), var_f, var_n, l
+        )
+        preds.append(float(mu[0]))
+        sds.append(float(np.sqrt(max(var[0, 0], 0.0))))
+
+    preds = np.array(preds)
+    sds = np.array(sds)
+
+    rmse_train = np.sqrt(mean_squared_error(y_train, preds))
+    r2_train = r2_score(y_train, preds)
+
+    lower_95 = preds - 1.96 * sds
+    upper_95 = preds + 1.96 * sds
+    coverage_95_train = np.mean((y_train >= lower_95) & (y_train <= upper_95))
+
+    return {
+        "rmse_train": rmse_train,
+        "r2_train": r2_train,
+        "coverage_95_train": coverage_95_train
+    }
+
+def compute_cv_diagnostics(X, y, kernel_func, n_splits=5, random_seed=123):
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=random_seed)
+
+    y_true_all = []
+    y_pred_all = []
+    y_sd_all = []
+
+    for train_idx, test_idx in kf.split(X):
+        X_tr, X_te = X[train_idx], X[test_idx]
+        y_tr, y_te = y[train_idx], y[test_idx]
+
+        var_f_cv, l_cv, var_n_cv, _ = fit_gp_hyperparams(X_tr, y_tr, kernel_func)
+
+        for x_test, y_test in zip(X_te, y_te):
+            mu, var = gp_regression_noisy(
+                X_tr, y_tr, kernel_func,
+                np.array([x_test]), var_f_cv, var_n_cv, l_cv
+            )
+            y_true_all.append(float(y_test))
+            y_pred_all.append(float(mu[0]))
+            y_sd_all.append(float(np.sqrt(max(var[0, 0], 0.0))))
+
+    y_true_all = np.array(y_true_all)
+    y_pred_all = np.array(y_pred_all)
+    y_sd_all = np.array(y_sd_all)
+
+    rmse_cv = np.sqrt(mean_squared_error(y_true_all, y_pred_all))
+    r2_cv = r2_score(y_true_all, y_pred_all)
+
+    lower_95 = y_pred_all - 1.96 * y_sd_all
+    upper_95 = y_pred_all + 1.96 * y_sd_all
+    coverage_95_cv = np.mean((y_true_all >= lower_95) & (y_true_all <= upper_95))
+
+    return {
+        "rmse_cv": rmse_cv,
+        "r2_cv": r2_cv,
+        "coverage_95_cv": coverage_95_cv
+    }
+
+# ============================================================
+# 4) Helper functions for multi-objective method
+# ============================================================
+
+def sample_from_unit_cube(n_samples, n_features=2, seed=123):
+    np.random.seed(seed)
+    return np.random.uniform(0, 1, (n_samples, n_features))
+
+def evaluate_particles_with_sd(particles, gpr_params):
+    X_sample, Y_sample, kernel_func, var_f, var_n, l = gpr_params
+    preds = []
+    stds = []
+    for p in particles:
+        mu, var = gp_regression_noisy(
+            X_sample, Y_sample, kernel_func,
+            np.array([p]), var_f, var_n, l
+        )
+        preds.append(float(mu[0]))
+        stds.append(float(np.sqrt(max(var[0, 0], 0.0))))
+    return np.array(preds), np.array(stds)
+
+def run_nsga2_refinement(
+    initial_points,
+    X_train, y_train,
+    kernel_func, var_f, var_n, lengthscales,
+    y_target=2.0,
+    n_gen=30,
+    seed=123
+):
+    def f1(x):
+        mu, var = gp_regression_noisy(
+            X_train, y_train, kernel_func,
+            x.reshape(1, -1), var_f, var_n, lengthscales
+        )
+        return (mu[0] - y_target)**2
+
+    def f2(x):
+        mu, var = gp_regression_noisy(
+            X_train, y_train, kernel_func,
+            x.reshape(1, -1), var_f, var_n, lengthscales
+        )
+        return np.sqrt(max(var[0, 0], 0.0))
+
+    problem = FunctionalProblem(
+        n_var=2,
+        objs=[f1, f2],
+        xl=np.array([0.0, 0.0]),
+        xu=np.array([1.0, 1.0])
+    )
+
+    pop_init = Population.new("X", initial_points)
+    algorithm = NSGA2(pop_size=len(initial_points), sampling=pop_init)
+    termination = get_termination("n_gen", n_gen)
+
+    res = pymoo_minimize(
+        problem,
+        algorithm,
+        termination,
+        seed=seed,
+        verbose=False
+    )
+
+    return res.X, res.F
+
+def multiobjective_inverse_design(
+    X_sample, Y_sample, kernel_func,
+    y_target=2.0,
+    K1=1000,
+    n_gen_nsga2=20,
+    n_iterations=200,
+    random_seed=123
+):
+    var_f_optimized, l_optimized, var_n_optimized, nlml = fit_gp_hyperparams(
+        X_sample, Y_sample, kernel_func
+    )
+
+    gpr_params = (
+        X_sample, Y_sample, kernel_func,
+        var_f_optimized, var_n_optimized, l_optimized
+    )
+
+    final_solutions_all = []
+    final_objectives_all = []
+
+    for iter_idx in range(n_iterations):
+        particles = sample_from_unit_cube(
+            K1, n_features=2, seed=random_seed + iter_idx
+        )
+
+        final_solutions, final_obj = run_nsga2_refinement(
+            initial_points=particles,
+            X_train=X_sample,
+            y_train=Y_sample,
+            kernel_func=kernel_func,
+            var_f=var_f_optimized,
+            var_n=var_n_optimized,
+            lengthscales=l_optimized,
+            y_target=y_target,
+            n_gen=n_gen_nsga2,
+            seed=random_seed + iter_idx
+        )
+
+        final_solutions_all.append(final_solutions)
+        final_objectives_all.append(final_obj)
+
+    return (
+        var_f_optimized, l_optimized, var_n_optimized, nlml,
+        final_solutions_all, final_objectives_all
+    )
+
+# ============================================================
+# 5) Run the method
+# ============================================================
+
+X_train, y_train = generate_synthetic_data_2d(n_points=30, noise_std=0.05, seed=123)
+y_target = 2.0
+n_iterations = 200
+
+(
+    var_f, l, var_n, nlml,
+    final_solutions_all,
+    final_objectives_all
+) = multiobjective_inverse_design(
+    X_sample=X_train,
+    Y_sample=y_train,
+    kernel_func=kernel,
+    y_target=y_target,
+    K1=1000,
+    n_gen_nsga2=20,
+    n_iterations=n_iterations,
+    random_seed=123
+)
+
+gpr_params = (X_train, y_train, kernel, var_f, var_n, l)
+
+# ============================================================
+# 6) Select one solution per replication
+#    Rule aligned with your current multi-objective code:
+#    choose Pareto solution whose predicted mean is closest to target
+# ============================================================
+
+nds = NonDominatedSorting()
+
+selected_solutions = []
+selected_means = []
+selected_uncertainties = []
+
+for i in range(n_iterations):
+    pop_X = final_solutions_all[i]
+    pop_F = final_objectives_all[i]
+
+    non_dom_idx = nds.do(pop_F, only_non_dominated_front=True)
+    pareto_solutions_i = pop_X[non_dom_idx]
+
+    pred_means_i, pred_stds_i = evaluate_particles_with_sd(
+        pareto_solutions_i,
+        gpr_params
+    )
+
+    idx_closest = np.argmin(np.abs(pred_means_i - y_target))
+
+    selected_solutions.append(pareto_solutions_i[idx_closest])
+    selected_means.append(pred_means_i[idx_closest])
+    selected_uncertainties.append(pred_stds_i[idx_closest])
+
+selected_solutions = np.array(selected_solutions)
+selected_means = np.array(selected_means)
+selected_uncertainties = np.array(selected_uncertainties)
+
+# ============================================================
+# 7) Training + CV diagnostics
+# ============================================================
+
+train_diag = compute_train_diagnostics(X_train, y_train, kernel, var_f, var_n, l)
+cv_diag = compute_cv_diagnostics(X_train, y_train, kernel, n_splits=5, random_seed=123)
+
+print("\nTraining diagnostics:")
+print(train_diag)
+
+print("\nCross-validation diagnostics:")
+print(cv_diag)
+
+# ============================================================
+# 8) Ground-truth evaluation at selected design
+# ============================================================
+
+true_values_selected = np.array([
+    ground_truth_function_2d(x_sel) for x_sel in selected_solutions
+])
+
+true_target_error = np.abs(true_values_selected - y_target)
+actual_abs_prediction_error = np.abs(true_values_selected - selected_means)
+
+lower_95 = selected_means - 1.96 * selected_uncertainties
+upper_95 = selected_means + 1.96 * selected_uncertainties
+coverage_95_selected = ((true_values_selected >= lower_95) &
+                        (true_values_selected <= upper_95)).astype(int)
+
+results_df = pd.DataFrame({
+    "x1": selected_solutions[:, 0],
+    "x2": selected_solutions[:, 1],
+    "pred_mean": selected_means,
+    "pred_sd": selected_uncertainties,
+    "true_value": true_values_selected,
+    "true_target_error": true_target_error,
+    "actual_abs_prediction_error": actual_abs_prediction_error,
+    "coverage_95_selected": coverage_95_selected
+})
+
+print("\nFirst few selected-solution results:")
+print(results_df.head())
+
+def mean_and_se(arr):
+    arr = np.asarray(arr)
+    return np.mean(arr), np.std(arr, ddof=1) / np.sqrt(len(arr))
+
+for col in ["pred_mean", "pred_sd", "true_value", "true_target_error", "actual_abs_prediction_error"]:
+    m, se = mean_and_se(results_df[col].values)
+    print(f"{col}: mean = {m:.10f}, SE = {se:.10f}")
+
+print(f"Selected-point 95% coverage = {results_df['coverage_95_selected'].mean():.4f}")
+
+# ============================================================
+# 9) Plot: true value at selected design vs replication
+# ============================================================
+
+plt.figure(figsize=(9,7))
+plt.scatter(np.arange(len(true_values_selected)), true_values_selected, alpha=0.8, edgecolors='k')
+plt.axhline(y=y_target, color='red', linestyle='--', label=f"Target = {y_target}")
+plt.xlabel("Replication", fontsize=16, labelpad=12)
+plt.ylabel(r"True value at selected design $f(x_{sel})$", fontsize=16, labelpad=12)
+plt.tick_params(axis='both', which='major', labelsize=16, pad=12)
+plt.ylim(1.8, 2.2)
+plt.legend(fontsize=14)
+plt.grid(False)
+plt.show()
+
+
+# ============================================================
+
+plt.figure(figsize=(9,7))
+plt.scatter(selected_uncertainties, selected_means)
+plt.ticklabel_format(useOffset=False, style='plain', axis='y')
+plt.axhline(y=y_target, color='r', linestyle='--', label=f'Target={y_target}')
+plt.tick_params(axis='both', which='major', labelsize=12)
+plt.xlim(0.015, 0.4)
+plt.ylim(1.9, 2.1)
+plt.xlabel("Standard deviation of optimal solution", fontsize=16, labelpad=12)
+plt.ylabel("Predicted value of optimal solution", fontsize=16, labelpad=12)
+plt.tick_params(axis='both', which='major', labelsize=16, pad=12)
+plt.legend()
+plt.show()
+
+plt.figure(figsize=(9,7))
+plt.scatter(
+    selected_solutions[:, 0],
+    selected_solutions[:, 1],
+    alpha=0.8,
+    edgecolors='k',
+    s=80
+)
+plt.xlabel("x1", fontsize=16)
+plt.ylabel("x2", fontsize=16)
+plt.tick_params(axis='both', which='major', labelsize=16, pad=12)
+plt.xlim(0, 1)
+plt.ylim(0, 1)
+plt.grid(False)
+plt.show()
+
+# Pareto front for first replication
+pop_X = final_solutions_all[0]
+pop_F = final_objectives_all[0]
+non_dom_idx = nds.do(pop_F, only_non_dominated_front=True)
+pareto_objectives_0 = pop_F[non_dom_idx]
+
+plt.figure(figsize=(7,5))
+plt.scatter(pareto_objectives_0[:, 0], pareto_objectives_0[:, 1])
+plt.xlabel(r"$(\mu - y_{\mathrm{target}})^2$")
+plt.ylabel(r"$\sigma$")
+plt.title("Pareto front for replication 1")
+plt.grid(False)
+plt.show()
+
+end_time = time.time()
+total_time = end_time - start_time
+print(f"Total optimization time: {total_time:.3f} seconds")
