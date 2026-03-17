@@ -1,0 +1,668 @@
+import time
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+from matplotlib import animation, cm
+import math
+from scipy.spatial.distance import cdist
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import plotly.io as pio
+import scipy.optimize as opt
+from scipy.optimize import minimize
+
+import warnings
+warnings.filterwarnings('ignore')
+
+!pip install pymoo
+
+from pymoo.problems.functional import FunctionalProblem
+from pymoo.algorithms.moo.nsga2 import NSGA2
+from pymoo.termination import get_termination
+from pymoo.optimize import minimize
+
+start_time = time.time()
+
+def kernel(x1, x2, var_f, l):
+    l = np.array(l)
+
+    if x1.ndim == 1:
+        x1 = x1.reshape(1, -1)
+    if x2.ndim == 1:
+        x2 = x2.reshape(1, -1)
+
+    diff = (x1[:, np.newaxis, :] - x2[np.newaxis, :, :]) ** 2
+    scaled_diff = diff / (2 * l**2)
+    pairwise_distances = np.sum(scaled_diff, axis=-1)
+
+    return var_f * np.exp(-pairwise_distances)
+
+
+#from google.colab import files
+#uploaded = files.upload()
+
+df = pd.read_csv("/content/Scaled_Water_Absorption.csv")
+
+df.columns
+
+X = df[['Plasticizer','Polymer_1','Toughener_1','Colorant','Stabilizer_1', 'Flame_retardant_1', 'Antioxidant',
+        'Metal_powder_1', 'Metal_powder_2', 'Metal_powder_3', 'Antistatic', 'Polymer_2', 'Stabilizer_2', 'Toughener_2', 'Clarifier_1',
+        'Clarifier_2', 'Clarifier_3', 'Polymer_3', 'Polymer_4', 'UV_absorber_1', 'UV_absorber_2', 'Flame_retardant_2', 'Polymer_5',
+        'Stabilizer_3', 'Filler_1', 'Filler_2', 'Toughener_3', 'Filler_3']]
+
+x1 = np.array(df['Plasticizer']).reshape(-1,1)
+x2 = np.array(df['Polymer_1']).reshape(-1,1)
+x3 = np.array(df['Toughener_1']).reshape(-1,1)
+x4 = np.array(df['Colorant']).reshape(-1,1)
+x5 = np.array(df['Stabilizer_1']).reshape(-1,1)
+x6 = np.array(df['Flame_retardant_1']).reshape(-1,1)
+x7 = np.array(df['Antioxidant']).reshape(-1,1)
+x8 = np.array(df['Metal_powder_1']).reshape(-1,1)
+x9 = np.array(df['Metal_powder_2']).reshape(-1,1)
+x10 = np.array(df['Metal_powder_3']).reshape(-1,1)
+x11 = np.array(df['Antistatic']).reshape(-1,1)
+x12 = np.array(df['Polymer_2']).reshape(-1,1)
+x13 = np.array(df['Stabilizer_2']).reshape(-1,1)
+x14 = np.array(df['Toughener_2']).reshape(-1,1)
+x15 = np.array(df['Clarifier_1']).reshape(-1,1)
+x16 = np.array(df['Clarifier_2']).reshape(-1,1)
+x17 = np.array(df['Clarifier_3']).reshape(-1,1)
+x18 = np.array(df['Polymer_3']).reshape(-1,1)
+x19 = np.array(df['Polymer_4']).reshape(-1,1)
+x20 = np.array(df['UV_absorber_1']).reshape(-1,1)
+x21 = np.array(df['UV_absorber_2']).reshape(-1,1)
+x22 = np.array(df['Flame_retardant_2']).reshape(-1,1)
+x23 = np.array(df['Polymer_5']).reshape(-1,1)
+x24 = np.array(df['Stabilizer_3']).reshape(-1,1)
+x25 = np.array(df['Filler_1']).reshape(-1,1)
+x26 = np.array(df['Filler_2']).reshape(-1,1)
+x27 = np.array(df['Toughener_3']).reshape(-1,1)
+x28 = np.array(df['Filler_3']).reshape(-1,1)
+
+
+
+x_train = np.concatenate((x1,x2,x3,x4,x5,x6,x7,x8,x9,x10,x11,x12,x13,x14,x15,x16,x17,x18,x19,x20,x21,x22,x23,x24,x25,x26,x27,x28),axis=1)
+
+np.random.seed(123)
+
+y_train = np.array(df['Water_Absorption_%']).reshape(-1,1)
+
+#GPR Regression + Negative Log Marginal Likelihood
+
+def gp_regression_noisy(X, y, k, x_star, var_f, var_n, l):
+    """
+    Predictive mean & variance for GPR with noise variance var_n.
+    X, y: training data, shape (N, d), (N,)
+    x_star: test location(s), shape (M, d)
+    var_f: signal variance
+    var_n: noise variance
+    l: length scales (array)
+    """
+    # Cov on training
+    Kxx = k(X, X, var_f, l) + var_n * np.eye(X.shape[0])
+    Lxx = np.linalg.cholesky(Kxx)
+    a = np.linalg.solve(Lxx.T, np.linalg.solve(Lxx, y))
+
+    # Cross-cov
+    Kxs = k(X, x_star, var_f, l)
+    mu = Kxs.T @ a  # predictive mean(s)
+
+    # Predictive var
+    v = np.linalg.solve(Lxx, Kxs)
+    Kss = k(x_star, x_star, var_f, l)
+    var = Kss - v.T @ v
+
+    return mu, var
+
+def f_opt(params, *args):
+    """
+    Negative log marginal likelihood objective for L-BFGS.
+    params = [var_f, l1, l2, ..., var_n]
+    """
+    X, y, k = args
+    d = X.shape[1]
+    var_f = params[0]
+    var_n = params[-1]
+    lengthscales = params[1:-1]
+
+    # Cov with noise
+    Kxx = k(X, X, var_f, lengthscales) + var_n*np.eye(X.shape[0])
+    Lxx = np.linalg.cholesky(Kxx)
+    a = np.linalg.solve(Lxx.T, np.linalg.solve(Lxx, y))
+    # Negative log marginal likelihood
+    n = X.shape[0]
+    logdetK = 2.0 * np.sum(np.log(np.diag(Lxx)))  # log(det(Kxx)) from Cholesky
+    return 0.5 * y.T @ a + 0.5 * logdetK + 0.5 * n * np.log(2.0 * np.pi)
+
+
+# Function to sample uniformly from the 6D unit cube
+def sample_from_unit_cube(n_samples, n_features = 28, seed = 123):
+    np.random.seed(seed)
+    return np.random.uniform(0, 1, (n_samples, n_features))
+
+# Function to run particles through the GPR model and get predicted responses and their standard deviations
+def evaluate_particles_with_sd(particles, gpr_params):
+    X_sample, Y_sample, kernel, var_f, var_n, l = gpr_params
+    predicted_responses = []
+    predicted_stds = []  # To store the standard deviations
+
+    for particle in particles:
+        mu, var = gp_regression_noisy(X_sample, Y_sample, kernel, np.array([particle]), var_f, var_n, l)
+        predicted_responses.append(mu[0])  # Store the predicted response (mean)
+        predicted_stds.append(np.sqrt(var[0, 0]))  # Store the standard deviation (sqrt of variance)
+
+    return np.array(predicted_responses).flatten(), np.array(predicted_stds).flatten()  # Ensure they are 1D arrays
+
+def get_responses_for_final_particles(final_particles, gpr_params):
+    """
+    Predict the response values for a set of particles using the GPR model.
+    final_particles: array of shape (K2, 2)
+    gpr_params: (X_sample, Y_sample, kernel_func, var_f, var_n, l)
+    """
+    X_sample, Y_sample, kernel_func, var_f, var_n, l = gpr_params
+    responses = []
+    std_dev_res = []
+    for particle in final_particles:
+        mu, var = gp_regression_noisy(X_sample, Y_sample, kernel_func,
+                                    np.array([particle]), var_f, var_n, l)
+        responses.append(mu[0])
+        std_dev_res.append(np.sqrt(var[0,0]))
+    return np.array(responses), np.array(std_dev_res)
+
+def run_nsga2_refinement(initial_points, X_train, y_train,
+                         kernel_func, var_f, var_n, lengthscales,
+                         y_target=4.2,
+                         n_gen=30,
+                         seed=123):
+    """
+    Runs a short NSGA-II optimization with an initial population = initial_points.
+    Minimizes 2 objectives:
+       f1(x) = (mu(x) - y_target)^2
+       f2(x) = std(x)
+    Domain: x in [0,1]^2
+
+    Returns final Pareto solutions (res.X) and objective values (res.F).
+    """
+
+    # 1) Define the objective functions as python callables
+    def f1(pop_X):
+
+      mu, var = gp_regression_noisy(X_train, y_train,
+                                    kernel_func,
+                                    pop_X,
+                                    var_f, var_n, lengthscales)
+      mu = mu.ravel()
+      return (mu - y_target)**2
+
+    def f2(pop_X):
+      mu, var = gp_regression_noisy(X_train, y_train,
+                                    kernel_func,
+                                    pop_X,
+                                    var_f, var_n, lengthscales)
+      var_diag = np.diag(var)
+      return np.sqrt(var_diag)
+
+    # 2) Create a FunctionalProblem with 2 objectives
+    problem = FunctionalProblem(
+        n_var=28,
+        objs=[f1, f2],
+        xl=[0.0]*28,
+        xu=[1.0]*28
+    )
+
+    # 3) Create an initial population from initial_points
+    #    'initial_points' is shape (K2, 2), so we will let pop_size = K2
+    from pymoo.core.population import Population
+    pop_init = Population.new("X", initial_points)
+
+    # 4) Define the NSGA-II algorithm with that initial population
+    from pymoo.algorithms.moo.nsga2 import NSGA2
+    algorithm = NSGA2(pop_size=len(initial_points),
+                      sampling=pop_init)  # override initial population
+
+    # 5) Termination: run for n_gen generations
+    from pymoo.termination import get_termination
+    termination = get_termination("n_gen", n_gen)
+
+    # 6) Run the optimization
+    from pymoo.optimize import minimize
+    res = minimize(problem,
+                   algorithm,
+                   termination,
+                   seed=seed,
+                   verbose=False)
+
+    return res.X, res.F
+
+def smc_inverse_regression_modified_with_gpr_sd_multiobj(
+    X_sample, Y_sample, kernel_func,
+    y_target=4.2,
+    K1=1000,
+    n_gen_nsga2=20,
+    random_seed=123,
+    n_iterations=50,
+):
+
+    np.random.seed(random_seed)
+
+    x0 = [1] + [1]*28 + [0.001]
+    bounds = [(1e-3, None)] + [(1e-3,1.0)]*28 + [(1e-5, None)]
+    args = (X_sample, Y_sample, kernel_func)
+    res = opt.fmin_l_bfgs_b(f_opt, x0, args=args, approx_grad=True, bounds=bounds)
+
+    var_f_optimized = res[0][0]
+    var_n_optimized = res[0][-1]
+    l_optimized = res[0][1:-1]
+
+    final_solutions_all = []
+    final_obj_all = []
+    sd_all_iterations_mo = []
+    min_sd_all_iterations_mo = []
+
+    for iter_idx in range(n_iterations):
+
+        # Step 1: sample K1 points from [0,1]^2
+        particles = sample_from_unit_cube(K1, n_features=28, seed=random_seed + iter_idx)
+
+        # Step 5: Instead of local gradient optimization, we do NSGA-II refinement
+        # starting from topK_particles
+        final_solutions, final_obj = run_nsga2_refinement(
+            initial_points=particles,
+            X_train=X_sample,
+            y_train=Y_sample,
+            kernel_func=kernel_func,
+            var_f=var_f_optimized,
+            var_n=var_n_optimized,
+            lengthscales=l_optimized,
+            y_target=y_target,
+            n_gen=n_gen_nsga2,
+            seed=random_seed + iter_idx
+        )
+
+        _, sd_mo = evaluate_particles_with_sd(
+            final_solutions,
+            (X_sample, Y_sample, kernel_func, var_f_optimized, var_n_optimized, l_optimized)
+        )
+
+        final_solutions_all.append(final_solutions)
+        final_obj_all.append(final_obj)
+        sd_all_iterations_mo.append(sd_mo)
+
+        min_sd_iter = np.min(sd_mo)
+        min_sd_all_iterations_mo.append(min_sd_iter)
+
+    return var_f_optimized, var_n_optimized, l_optimized, final_solutions_all, final_obj_all, sd_all_iterations_mo, min_sd_all_iterations_mo
+
+def get_responses_for_final_particles(final_particles, gpr_params):
+    """
+    Predict the response values for a set of particles using the GPR model.
+    final_particles: array of shape (K2, 2)
+    gpr_params: (X_sample, Y_sample, kernel_func, var_f, var_n, l)
+    """
+    X_sample, Y_sample, kernel_func, var_f, var_n, l = gpr_params
+    responses = []
+    std_dev_res = []
+    for particle in final_particles:
+        mu, var = gp_regression_noisy(X_sample, Y_sample, kernel_func,
+                                    np.array([particle]), var_f, var_n, l)
+        responses.append(mu[0])
+        std_dev_res.append(np.sqrt(var[0,0]))
+    return np.array(responses)
+
+X_sample = x_train
+Y_sample = y_train
+
+# Generate x_star for predictions
+n = 100  # number of test points
+x1_min, x1_max = np.min(x1), np.max(x1)
+x2_min, x2_max = np.min(x2), np.max(x2)
+x3_min, x3_max = np.min(x3), np.max(x3)
+x4_min, x4_max = np.min(x4), np.max(x4)
+x5_min, x5_max = np.min(x5), np.max(x5)
+x6_min, x6_max = np.min(x6), np.max(x6)
+x7_min, x7_max = np.min(x7), np.max(x7)
+x8_min, x8_max = np.min(x8), np.max(x8)
+x9_min, x9_max = np.min(x9), np.max(x9)
+x10_min, x10_max = np.min(x10), np.max(x10)
+x11_min, x11_max = np.min(x11), np.max(x11)
+x12_min, x12_max = np.min(x12), np.max(x12)
+x13_min, x13_max = np.min(x13), np.max(x13)
+x14_min, x14_max = np.min(x14), np.max(x14)
+x15_min, x15_max = np.min(x15), np.max(x15)
+x16_min, x16_max = np.min(x16), np.max(x16)
+x17_min, x17_max = np.min(x17), np.max(x17)
+x18_min, x18_max = np.min(x18), np.max(x18)
+x19_min, x19_max = np.min(x19), np.max(x19)
+x20_min, x20_max = np.min(x20), np.max(x20)
+x21_min, x21_max = np.min(x21), np.max(x21)
+x22_min, x22_max = np.min(x22), np.max(x22)
+x23_min, x23_max = np.min(x23), np.max(x23)
+x24_min, x24_max = np.min(x24), np.max(x24)
+x25_min, x25_max = np.min(x25), np.max(x25)
+x26_min, x26_max = np.min(x26), np.max(x26)
+x27_min, x27_max = np.min(x27), np.max(x27)
+x28_min, x28_max = np.min(x28), np.max(x28)
+
+x1_star = np.linspace(x1_min, x1_max, n).reshape(-1,1)
+x2_star = np.linspace(x2_min, x2_max, n).reshape(-1,1)
+x3_star = np.linspace(x3_min, x3_max, n).reshape(-1,1)
+x4_star = np.linspace(x4_min, x4_max, n).reshape(-1,1)
+x5_star = np.linspace(x5_min, x5_max, n).reshape(-1,1)
+x6_star = np.linspace(x6_min, x6_max, n).reshape(-1,1)
+x7_star = np.linspace(x7_min, x7_max, n).reshape(-1,1)
+x8_star = np.linspace(x8_min, x8_max, n).reshape(-1,1)
+x9_star = np.linspace(x9_min, x9_max, n).reshape(-1,1)
+x10_star = np.linspace(x10_min, x10_max, n).reshape(-1,1)
+x11_star = np.linspace(x11_min, x11_max, n).reshape(-1,1)
+x12_star = np.linspace(x12_min, x12_max, n).reshape(-1,1)
+x13_star = np.linspace(x13_min, x13_max, n).reshape(-1,1)
+x14_star = np.linspace(x14_min, x14_max, n).reshape(-1,1)
+x15_star = np.linspace(x15_min, x15_max, n).reshape(-1,1)
+x16_star = np.linspace(x16_min, x16_max, n).reshape(-1,1)
+x17_star = np.linspace(x17_min, x17_max, n).reshape(-1,1)
+x18_star = np.linspace(x18_min, x18_max, n).reshape(-1,1)
+x19_star = np.linspace(x19_min, x19_max, n).reshape(-1,1)
+x20_star = np.linspace(x20_min, x20_max, n).reshape(-1,1)
+x21_star = np.linspace(x21_min, x21_max, n).reshape(-1,1)
+x22_star = np.linspace(x22_min, x22_max, n).reshape(-1,1)
+x23_star = np.linspace(x23_min, x23_max, n).reshape(-1,1)
+x24_star = np.linspace(x24_min, x24_max, n).reshape(-1,1)
+x25_star = np.linspace(x25_min, x25_max, n).reshape(-1,1)
+x26_star = np.linspace(x26_min, x26_max, n).reshape(-1,1)
+x27_star = np.linspace(x27_min, x27_max, n).reshape(-1,1)
+x28_star = np.linspace(x28_min, x28_max, n).reshape(-1,1)
+
+x_star = np.concatenate((x1_star,x2_star,x3_star,x4_star,x5_star,x6_star,x7_star,x8_star,x9_star,x10_star,x11_star,x12_star,x13_star,
+                         x14_star,x15_star,x16_star,x17_star,x18_star,x19_star,x20_star,x21_star,x22_star,
+                         x23_star,x24_star,x25_star,x26_star,x27_star,x28_star), axis=1)
+
+# Run the SMC process and get final particles and optimized GPR hyperparameters
+
+import scipy.optimize as opt
+import pprint
+import tqdm
+from plotly.subplots import make_subplots
+
+bounds = [(1e-3, None)] + [(1e-3,1.0)]*28 + [(1e-5, None)]  # Hyperparameter bounds
+
+y_target = 4.2
+
+(var_f, var_n, l,
+ final_solutions_all,
+ final_objectives_all,
+ sd_all_iterations_mo,
+ min_sd_all_iterations_mo) = smc_inverse_regression_modified_with_gpr_sd_multiobj(
+    X_sample=x_train,
+    Y_sample=y_train,
+    kernel_func=kernel,
+    y_target=4.2,
+    K1=1000,         # e.g., sample 5K points
+    random_seed=123,
+    n_iterations=50,  # or 5, 10, etc.
+    n_gen_nsga2=20   # e.g., 20 generations
+)
+
+gpr_params = (x_train, y_train, kernel, var_f, var_n, l)
+
+best_particle_predictions = []
+best_particle_stds = []
+n_iterations=50
+for i in range(n_iterations):
+    # Evaluate final (Phase 2) particles from iteration i
+    preds_i, stds_i = evaluate_particles_with_sd(
+        final_solutions_all[i],  # shape (K2, d)
+        gpr_params
+    )
+
+    # Identify the particle with the minimum std
+    min_std_idx = np.argmin(stds_i)
+
+    # Get the corresponding mean prediction
+    best_particle_predictions.append(preds_i[min_std_idx])
+    best_particle_stds.append(stds_i[min_std_idx])
+
+
+from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
+import numpy as np
+
+nds = NonDominatedSorting()
+
+pareto_solutions_all = []
+pareto_objectives_all = []
+
+n_iterations = 50
+for i in range(n_iterations):
+    # Extract final population (X) and their objectives (F) from iteration i
+    pop_X = final_solutions_all[i]  # shape (pop_size, 2)
+    pop_F = final_objectives_all[i] # shape (pop_size, 2) if two objectives
+
+    # Find indices of the non-dominated front
+    non_dom_idx = nds.do(pop_F, only_non_dominated_front=True)
+
+    # Slice out the Pareto solutions and objective values
+    pareto_solutions_i = pop_X[non_dom_idx]
+    pareto_objectives_i = pop_F[non_dom_idx]
+
+    pareto_solutions_all.append(pareto_solutions_i)
+    pareto_objectives_all.append(pareto_objectives_i)
+
+# Now pareto_solutions_all[i] contains only the non-dominated solutions
+# for iteration i, and pareto_objectives_all[i] contains the corresponding objectives.
+
+
+from typing import List, Tuple
+import numpy as np
+
+# Suppose you already have:
+#    pareto_solutions_all  (list of arrays)
+#    gpr_params           (tuple for your GP: (X_train, y_train, kernel_func, var_f, var_n, l))
+#    n_iterations         = 50
+
+# Storage for predicted means and std devs for each Pareto set
+pareto_predictions_all = []
+pareto_uncertainties_all = []
+
+for i in range(n_iterations):
+    # Grab Pareto solutions for replication i
+    pareto_solutions_i = pareto_solutions_all[i]  # shape (#pareto_points, 2)
+
+    # Evaluate predicted mean & std dev using your helper:
+    pred_means_i, pred_stds_i = evaluate_particles_with_sd(
+        pareto_solutions_i,  # pass the points
+        gpr_params           # the GP parameters
+    )
+
+    # Store them
+    pareto_predictions_all.append(pred_means_i)   # shape (#pareto_points,)
+    pareto_uncertainties_all.append(pred_stds_i)  # shape (#pareto_points,)
+
+# Now:
+#   pareto_predictions_all[i] is a 1D array of predicted values for iteration i’s Pareto solutions
+#   pareto_uncertainties_all[i] is the corresponding array of std devs.
+
+
+import numpy as np
+
+y_target = 4.2
+n_iterations = 50  # or however many replications
+
+selected_solutions = []
+selected_means = []
+selected_uncertainties = []
+
+for i in range(n_iterations):
+    # The predicted means for all Pareto solutions in replication i
+    means_i = pareto_predictions_all[i]
+
+    # Find the index of the solution whose mean is closest to y_target
+    idx_closest = np.argmin(np.abs(means_i - y_target))
+
+    # Extract that solution and its predicted mean + std
+    best_sol = pareto_solutions_all[i][idx_closest]
+    best_mean = means_i[idx_closest]
+    best_std = pareto_uncertainties_all[i][idx_closest]
+
+    # Store them in lists
+    selected_solutions.append(best_sol)
+    selected_means.append(best_mean)
+    selected_uncertainties.append(best_std)
+
+plt.figure(figsize=(9,7))
+plt.scatter(selected_uncertainties,selected_means)
+plt.ticklabel_format(useOffset=False, style='plain', axis='y')
+plt.axhline(y=y_target, color='r', linestyle='--', label=f'Target={y_target}')
+plt.tick_params(axis='both', which='major', labelsize=12)
+plt.xlim(0.15,1.3)
+plt.ylim(4,4.4)
+plt.xlabel("Standard Deviation of proposed solution", fontsize=16, labelpad=12)
+plt.xticks(rotation=30)
+plt.ylabel("Predicted Value of proposed solution", fontsize=16, labelpad=12)
+plt.tick_params(axis='both', which='major', labelsize=16, pad = 12)
+#plt.title("Predicted Value vs Standard Deviation for the proposed solution of 50 replications", fontsize=14)
+plt.legend()
+plt.show()
+
+import numpy as np
+
+best_pred_array = np.array(selected_means)  # shape (50,)
+
+# Sample mean of those 50 best predicted values
+mean_best = np.mean(best_pred_array)
+
+# Sample standard deviation (ddof=1 for unbiased estimate)
+sd_best = np.std(best_pred_array, ddof=1)
+
+# Standard error
+n_replications = len(best_pred_array)  # should be 50
+se_best = sd_best / np.sqrt(n_replications)
+
+print(f"Mean of the best predicted responses = {mean_best:.4f}")
+print(f"Standard error of the best predicted responses = {se_best:.4f}")
+se_best
+
+import numpy as np
+
+best_pred_array = np.array(selected_uncertainties)  # shape (50,)
+
+# Sample mean of those 50 best predicted values
+mean_best = np.mean(best_pred_array)
+
+# Sample standard deviation (ddof=1 for unbiased estimate)
+sd_best = np.std(best_pred_array, ddof=1)
+
+# Standard error
+n_replications = len(best_pred_array)  # should be 50
+se_best = sd_best / np.sqrt(n_replications)
+
+print(f"Mean of the standard deviation of the best solutions = {mean_best:.4f}")
+print(f"Standard error of the standard deviation of the best solutions = {se_best:.4f}")
+se_best
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+# --- Assume you have these objects from your existing code ---
+# final_particles_all: list of length n_iterations
+#   final_particles_all[i] is an array of shape (K2, 2)
+#   containing the final solutions for replication i.
+# gpr_params = (X_train, y_train, kernel, var_f, var_n, l)
+# evaluate_particles_with_sd(...) function to compute GPR mean & std dev.
+
+# 1) For each replication, select the particle with the minimum uncertainty
+best_final_particles = []
+best_final_stds = []
+
+n_iterations = len(selected_solutions)
+
+for i in range(n_iterations):
+    particles_i = selected_solutions[i]               # shape (K2, 2)
+    _, stds_i = evaluate_particles_with_sd(particles_i, gpr_params)
+
+    # Index of minimum std dev among these K2 solutions
+    idx_min = np.argmin(stds_i)
+
+    # Store the best solution and its std dev
+    best_final_particles.append(particles_i[idx_min])
+    best_final_stds.append(stds_i[idx_min])
+
+best_final_particles = np.array(best_final_particles)  # shape (n_iterations, 2)
+best_final_stds = np.array(best_final_stds)            # shape (n_iterations,)
+
+# Convert to Pandas DataFrame for Seaborn
+selected_solutions = np.array(selected_solutions)
+feature_names = [f"x{i+1}" for i in range(selected_solutions.shape[1])]  # ["x1", "x2", ..., "x6"]
+df_best_solutions = pd.DataFrame(selected_solutions, columns=feature_names)
+
+import pandas as pd
+import numpy as np
+from pathlib import Path
+# ------------------------------------------------------------------
+# 1.  Load the ORIGINAL (un‑scaled) data set
+# ------------------------------------------------------------------
+# >>> change the path if your file lives somewhere else
+orig_path = Path("/content/Water Absorption.csv")   # or "/mnt/data/…"
+orig_df   = pd.read_csv(orig_path)
+
+# ------------------------------------------------------------------
+# 2.  Columns that were scaled in your experiment
+# ------------------------------------------------------------------
+feature_cols = [
+        'Plasticizer','Polymer_1','Toughener_1','Colorant','Stabilizer_1', 'Flame_retardant_1', 'Antioxidant',
+        'Metal_powder_1', 'Metal_powder_2', 'Metal_powder_3', 'Antistatic', 'Polymer_2', 'Stabilizer_2', 'Toughener_2', 'Clarifier_1',
+        'Clarifier_2', 'Clarifier_3', 'Polymer_3', 'Polymer_4', 'UV_absorber_1', 'UV_absorber_2', 'Flame_retardant_2', 'Polymer_5',
+        'Stabilizer_3', 'Filler_1', 'Filler_2', 'Toughener_3', 'Filler_3',
+]
+
+# ------------------------------------------------------------------
+# 3.  Pre‑compute column‑wise min and max
+# ------------------------------------------------------------------
+col_min = orig_df[feature_cols].min().to_numpy()   # shape (6,)
+col_max = orig_df[feature_cols].max().to_numpy()   # shape (6,)
+
+# ------------------------------------------------------------------
+# 4.  A small helper that works for a single vector *or* a matrix
+# ------------------------------------------------------------------
+def inverse_min_max(x_scaled: np.ndarray,
+                    vmin: np.ndarray = col_min,
+                    vmax: np.ndarray = col_max) -> np.ndarray:
+    """
+    Convert scaled values in [0,1]^d back to the original units.
+
+    Parameters
+    ----------
+    x_scaled : (n_samples, d) or (d,) ndarray
+        Scaled feature values in the unit hyper‑cube.
+    vmin, vmax : (d,) ndarray
+        Column‑wise minima and maxima from the *original* data set.
+
+    Returns
+    -------
+    x_orig : ndarray with the same shape as x_scaled
+        Rescaled feature values.
+    """
+    x_scaled = np.asarray(x_scaled, dtype=float)
+    return x_scaled * (vmax - vmin) + vmin
+
+
+# ------------------------------------------------------------------
+# 5.  Examples
+# ------------------------------------------------------------------
+# (a) One best particle ------------------------------------------------
+# pick the first (or any) particle
+best_particle_scaled = best_final_particles[0]        # shape (6,)
+
+best_particle_orig = inverse_min_max(best_particle_scaled)  # still (6,)
+
+best_particle_df = pd.DataFrame(
+    best_particle_orig.reshape(1, -1),                # make it 2‑D: (1, 6)
+    columns=feature_cols,
+    index=["Best‑particle"]
+)
+print(best_particle_df.round(4))
+
+best_particle_df.to_csv("water absorption MO.csv")
+
+end_time = time.time()
+total_time = end_time - start_time
+print(f"Total optimization time: {total_time:.3f} seconds")
