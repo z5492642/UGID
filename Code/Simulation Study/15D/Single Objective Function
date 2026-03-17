@@ -1,0 +1,442 @@
+import time
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import scipy.optimize as opt
+import warnings
+from sklearn.model_selection import KFold
+from sklearn.metrics import mean_squared_error, r2_score
+
+warnings.filterwarnings('ignore')
+
+start_time = time.time()
+
+# ============================================================
+# 1) Ground truth and synthetic data
+# ============================================================
+
+def ground_truth_function_15d(x):
+    (x1, x2, x3, x4, x5,
+     x6, x7, x8, x9, x10,
+     x11, x12, x13, x14, x15) = x
+
+    val = (
+        np.sin(2.0*np.pi*x1) * np.cos(2.0*np.pi*x2) * np.sin(2.0*np.pi*x3)
+        + 0.8 * np.cos(2.0*np.pi*x4) * np.sin(2.0*np.pi*x5)
+        + 0.6 * np.cos(2.0*np.pi*x6) * np.sin(2.0*np.pi*x7)
+        + 0.5 * np.cos(2.0*np.pi*x8) * np.sin(2.0*np.pi*x9)
+        + 0.4 * np.cos(2.0*np.pi*x10) * np.sin(2.0*np.pi*x11)
+        + 0.7 * np.cos(2.0*np.pi*x12) * np.sin(2.0*np.pi*x13)
+        + 0.65 * np.cos(2.0*np.pi*x14) * np.sin(2.0*np.pi*x15)
+        + 1.5
+    )
+    return val
+
+def generate_synthetic_data_15d(n_points=30, noise_std=0.05, seed=123):
+    np.random.seed(seed)
+    X = np.random.rand(n_points, 15)
+    y_clean = np.array([ground_truth_function_15d(xi) for xi in X])
+    noise = noise_std * np.random.randn(n_points)
+    y_noisy = y_clean + noise
+    return X, y_noisy
+
+# ============================================================
+# 2) Kernel and GP functions
+# ============================================================
+
+def kernel(x1, x2, var_f, lengthscales):
+    if x1.ndim == 1:
+        x1 = x1.reshape(1, -1)
+    if x2.ndim == 1:
+        x2 = x2.reshape(1, -1)
+
+    diff = (x1[:, np.newaxis, :] - x2[np.newaxis, :, :]) ** 2
+    lengthscales = np.array(lengthscales)
+    scaled_diff = diff / (2 * lengthscales**2)
+    pairwise_distances = np.sum(scaled_diff, axis=-1)
+    return var_f * np.exp(-pairwise_distances)
+
+def gp_regression_noisy(X, y, k, x_star, var_f, var_n, l):
+    if x_star.ndim == 1:
+        x_star = x_star.reshape(1, -1)
+
+    Kxx = k(X, X, var_f, l) + var_n * np.eye(X.shape[0])
+    Lxx = np.linalg.cholesky(Kxx)
+    a = np.linalg.solve(Lxx.T, np.linalg.solve(Lxx, y))
+
+    Kxs = k(X, x_star, var_f, l)
+    mu = Kxs.T @ a
+
+    v = np.linalg.solve(Lxx, Kxs)
+    Kss = k(x_star, x_star, var_f, l)
+    var = Kss - v.T @ v
+
+    return mu, var
+
+def f_opt(params, *args):
+    X, y, k = args
+    var_f = params[0]
+    var_n = params[-1]
+    lengthscales = params[1:-1]
+
+    Kxx = k(X, X, var_f, lengthscales) + var_n * np.eye(X.shape[0])
+    Lxx = np.linalg.cholesky(Kxx)
+    a = np.linalg.solve(Lxx.T, np.linalg.solve(Lxx, y))
+
+    n = X.shape[0]
+    logdetK = 2.0 * np.sum(np.log(np.diag(Lxx)))
+    return 0.5 * y.T @ a + 0.5 * logdetK + 0.5 * n * np.log(2.0 * np.pi)
+
+def fit_gp_hyperparams(X_sample, Y_sample, kernel_func):
+    x0 = [1.0] + [0.3]*15 + [0.01]
+    bounds = [(1e-3, None)] + [(1e-3, 1.0)]*15 + [(1e-5, None)]
+    args = (X_sample, Y_sample, kernel_func)
+    res = opt.fmin_l_bfgs_b(f_opt, x0, args=args, approx_grad=True, bounds=bounds)
+
+    var_f = res[0][0]
+    l = res[0][1:-1]
+    var_n = res[0][-1]
+    nlml = res[1]
+    return var_f, l, var_n, nlml
+
+# ============================================================
+# 3) Diagnostics functions
+# ============================================================
+
+def compute_train_diagnostics(X_train, y_train, kernel_func, var_f, var_n, l):
+    preds = []
+    sds = []
+
+    for x in X_train:
+        mu, var = gp_regression_noisy(
+            X_train, y_train, kernel_func,
+            np.array([x]), var_f, var_n, l
+        )
+        preds.append(float(mu[0]))
+        sds.append(float(np.sqrt(max(var[0, 0], 0.0))))
+
+    preds = np.array(preds)
+    sds = np.array(sds)
+
+    rmse_train = np.sqrt(mean_squared_error(y_train, preds))
+    r2_train = r2_score(y_train, preds)
+
+    lower_95 = preds - 1.96 * sds
+    upper_95 = preds + 1.96 * sds
+    coverage_95_train = np.mean((y_train >= lower_95) & (y_train <= upper_95))
+
+    return {
+        "rmse_train": rmse_train,
+        "r2_train": r2_train,
+        "coverage_95_train": coverage_95_train
+    }
+
+def compute_cv_diagnostics(X, y, kernel_func, n_splits=3, random_seed=123):
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=random_seed)
+
+    y_true_all = []
+    y_pred_all = []
+    y_sd_all = []
+
+    for train_idx, test_idx in kf.split(X):
+        X_tr, X_te = X[train_idx], X[test_idx]
+        y_tr, y_te = y[train_idx], y[test_idx]
+
+        var_f_cv, l_cv, var_n_cv, _ = fit_gp_hyperparams(X_tr, y_tr, kernel_func)
+
+        for x_test, y_test in zip(X_te, y_te):
+            mu, var = gp_regression_noisy(
+                X_tr, y_tr, kernel_func,
+                np.array([x_test]), var_f_cv, var_n_cv, l_cv
+            )
+            y_true_all.append(float(y_test))
+            y_pred_all.append(float(mu[0]))
+            y_sd_all.append(float(np.sqrt(max(var[0, 0], 0.0))))
+
+    y_true_all = np.array(y_true_all)
+    y_pred_all = np.array(y_pred_all)
+    y_sd_all = np.array(y_sd_all)
+
+    rmse_cv = np.sqrt(mean_squared_error(y_true_all, y_pred_all))
+    r2_cv = r2_score(y_true_all, y_pred_all)
+
+    lower_95 = y_pred_all - 1.96 * y_sd_all
+    upper_95 = y_pred_all + 1.96 * y_sd_all
+    coverage_95_cv = np.mean((y_true_all >= lower_95) & (y_true_all <= upper_95))
+
+    return {
+        "rmse_cv": rmse_cv,
+        "r2_cv": r2_cv,
+        "coverage_95_cv": coverage_95_cv
+    }
+
+# ============================================================
+# 4) Single-objective helper functions
+# ============================================================
+
+def evaluate_particles_with_sd(particles, gpr_params):
+    X_sample, Y_sample, kernel_func, var_f, var_n, l = gpr_params
+    preds = []
+    stds = []
+    for p in particles:
+        mu, var = gp_regression_noisy(
+            X_sample, Y_sample, kernel_func,
+            np.array([p]), var_f, var_n, l
+        )
+        preds.append(float(mu[0]))
+        stds.append(float(np.sqrt(max(var[0, 0], 0.0))))
+    return np.array(preds), np.array(stds)
+
+def objective_function(x, gpr_params, y_target, alpha=100):
+    X_sample, Y_sample, kernel_func, var_f, var_n, l = gpr_params
+    mu, var = gp_regression_noisy(
+        X_sample, Y_sample, kernel_func,
+        np.array([x]), var_f, var_n, l
+    )
+    sigma_term = max(var[0, 0], 0.0)   # variance term, as in your original code
+    return (mu[0] - y_target)**2 + alpha * sigma_term
+
+def run_pso(
+    init_positions,
+    gpr_params,
+    y_target,
+    alpha=100,
+    n_steps=20,
+    w=0.5,
+    c1=1.0,
+    c2=1.0,
+    seed=123
+):
+    np.random.seed(seed)
+    n_particles = init_positions.shape[0]
+
+    positions = init_positions.copy()
+    velocities = np.zeros_like(positions)
+
+    fitness = np.array([
+        objective_function(pos, gpr_params, y_target, alpha) for pos in positions
+    ])
+
+    personal_best_positions = positions.copy()
+    personal_best_fitness = fitness.copy()
+
+    gbest_idx = np.argmin(personal_best_fitness)
+    global_best_position = personal_best_positions[gbest_idx].copy()
+    global_best_fitness = personal_best_fitness[gbest_idx]
+
+    for step in range(n_steps):
+        for i in range(n_particles):
+            r1, r2 = np.random.rand(), np.random.rand()
+            velocities[i] = (
+                w * velocities[i]
+                + c1 * r1 * (personal_best_positions[i] - positions[i])
+                + c2 * r2 * (global_best_position - positions[i])
+            )
+            positions[i] += velocities[i]
+            positions[i] = np.clip(positions[i], 0, 1)
+
+            fit_val = objective_function(positions[i], gpr_params, y_target, alpha)
+            if fit_val < personal_best_fitness[i]:
+                personal_best_positions[i] = positions[i].copy()
+                personal_best_fitness[i] = fit_val
+
+        gbest_idx = np.argmin(personal_best_fitness)
+        if personal_best_fitness[gbest_idx] < global_best_fitness:
+            global_best_position = personal_best_positions[gbest_idx].copy()
+            global_best_fitness = personal_best_fitness[gbest_idx]
+
+    return global_best_position
+
+def sample_particles_from_training_data(training_data, K1, seed=123):
+    np.random.seed(seed)
+    n_train = training_data.shape[0]
+
+    if K1 <= n_train:
+        idxs = np.random.choice(n_train, K1, replace=False)
+    else:
+        idxs = np.random.choice(n_train, K1, replace=True)
+
+    particles = training_data[idxs].copy()
+    particles += 0.01 * (np.random.rand(*particles.shape) - 0.5)
+    particles = np.clip(particles, 0, 1)
+    return particles
+
+# ============================================================
+# 5) Single-objective main function
+# ============================================================
+
+def single_objective_inverse_design_15d(
+    X_sample, Y_sample, kernel_func,
+    y_target=2.0,
+    K1=1000,
+    random_seed=123,
+    n_iterations=100,
+    pso_steps=20,
+    alpha=100
+):
+    var_f_optimized, l_optimized, var_n_optimized, nlml = fit_gp_hyperparams(
+        X_sample, Y_sample, kernel_func
+    )
+
+    gpr_params = (
+        X_sample, Y_sample, kernel_func,
+        var_f_optimized, var_n_optimized, l_optimized
+    )
+
+    best_solutions_each_iter = []
+    best_solutions_preds_each_iter = []
+    best_solutions_stds_each_iter = []
+
+    for iter_idx in range(n_iterations):
+        init_particles = sample_particles_from_training_data(
+            X_sample, K1, seed=(random_seed + iter_idx)
+        )
+
+        best_sol = run_pso(
+            init_positions=init_particles,
+            gpr_params=gpr_params,
+            y_target=y_target,
+            alpha=alpha,
+            n_steps=pso_steps,
+            w=0.5, c1=1.0, c2=1.0,
+            seed=(random_seed + iter_idx)
+        )
+
+        pred, std_ = evaluate_particles_with_sd(
+            np.array([best_sol]),
+            gpr_params
+        )
+
+        best_solutions_each_iter.append(best_sol)
+        best_solutions_preds_each_iter.append(pred[0])
+        best_solutions_stds_each_iter.append(std_[0])
+
+    return (
+        var_f_optimized, l_optimized, var_n_optimized, nlml,
+        np.array(best_solutions_each_iter),
+        np.array(best_solutions_preds_each_iter),
+        np.array(best_solutions_stds_each_iter)
+    )
+
+# ============================================================
+# 6) Run 15D single-objective method
+# ============================================================
+
+X_train, y_train = generate_synthetic_data_15d(n_points=30, noise_std=0.05, seed=123)
+y_target = 2.0
+n_iterations = 100
+
+(
+    var_f, l, var_n, nlml,
+    best_solutions_each_iter,
+    best_particle_predictions,
+    best_particle_stds
+) = single_objective_inverse_design_15d(
+    X_sample=X_train,
+    Y_sample=y_train,
+    kernel_func=kernel,
+    y_target=y_target,
+    K1=1000,
+    random_seed=123,
+    n_iterations=n_iterations,
+    pso_steps=20,
+    alpha=100
+)
+
+gpr_params = (X_train, y_train, kernel, var_f, var_n, l)
+
+# ============================================================
+# 7) Training + CV diagnostics
+# ============================================================
+
+train_diag = compute_train_diagnostics(X_train, y_train, kernel, var_f, var_n, l)
+cv_diag = compute_cv_diagnostics(X_train, y_train, kernel, n_splits=3, random_seed=123)
+
+print("\nTraining diagnostics:")
+print(train_diag)
+
+print("\nCross-validation diagnostics:")
+print(cv_diag)
+
+# ============================================================
+# 8) Ground-truth evaluation at selected design
+# ============================================================
+
+true_values_selected = np.array([
+    ground_truth_function_15d(x_sel) for x_sel in best_solutions_each_iter
+])
+
+true_target_error = np.abs(true_values_selected - y_target)
+actual_abs_prediction_error = np.abs(true_values_selected - best_particle_predictions)
+
+lower_95 = best_particle_predictions - 1.96 * best_particle_stds
+upper_95 = best_particle_predictions + 1.96 * best_particle_stds
+coverage_95_selected = ((true_values_selected >= lower_95) &
+                        (true_values_selected <= upper_95)).astype(int)
+
+results_df = pd.DataFrame({
+    **{f"x{i+1}": best_solutions_each_iter[:, i] for i in range(15)},
+    "pred_mean": best_particle_predictions,
+    "pred_sd": best_particle_stds,
+    "true_value": true_values_selected,
+    "true_target_error": true_target_error,
+    "actual_abs_prediction_error": actual_abs_prediction_error,
+    "coverage_95_selected": coverage_95_selected
+})
+
+print("\nFirst few selected-solution results:")
+print(results_df.head())
+
+def mean_and_se(arr):
+    arr = np.asarray(arr)
+    return np.mean(arr), np.std(arr, ddof=1) / np.sqrt(len(arr))
+
+for col in ["pred_mean", "pred_sd", "true_value", "true_target_error", "actual_abs_prediction_error"]:
+    m, se = mean_and_se(results_df[col].values)
+    print(f"{col}: mean = {m:.10f}, SE = {se:.10f}")
+
+print(f"Selected-point 95% coverage = {results_df['coverage_95_selected'].mean():.4f}")
+
+# ============================================================
+# 9) Plot: true value at selected design vs replication
+# ============================================================
+
+plt.figure(figsize=(9,7))
+plt.scatter(np.arange(len(true_values_selected)), true_values_selected, alpha=0.8, edgecolors='k')
+plt.axhline(y=y_target, color='red', linestyle='--', label=f"Target = {y_target}")
+plt.xlabel("Replication", fontsize=16, labelpad=12)
+plt.ylabel(r"True value at selected design $f(x_{sel})$", fontsize=16, labelpad=12)
+plt.tick_params(axis='both', which='major', labelsize=16, pad=12)
+plt.ylim(1.8, 2.2)
+plt.legend(fontsize=14)
+plt.grid(False)
+plt.show()
+
+
+
+# ============================================================
+
+plt.figure(figsize=(9,7))
+plt.scatter(best_particle_stds, best_particle_predictions)
+plt.ticklabel_format(useOffset=False, style='plain', axis='both')
+plt.axhline(y=y_target, color='r', linestyle='--', label=f'Target={y_target}')
+plt.tick_params(axis='both', which='major', labelsize=12)
+plt.xlim(0.2, 1.0)
+plt.ylim(1.9, 2.1)
+plt.xlabel("Standard deviation of optimal solution", fontsize=16, labelpad=12)
+plt.ylabel("Predicted value of optimal solution", fontsize=16, labelpad=12)
+plt.tick_params(axis='both', which='major', labelsize=16, pad=12)
+plt.legend()
+plt.show()
+
+feature_names = [f"x{i+1}" for i in range(best_solutions_each_iter.shape[1])]
+df_best_solutions = pd.DataFrame(best_solutions_each_iter, columns=feature_names)
+
+sns.pairplot(df_best_solutions, diag_kind="hist", corner=True)
+plt.suptitle("Pairwise scatter plots of final solutions", y=1.02, fontsize=16)
+plt.show()
+
+end_time = time.time()
+total_time = end_time - start_time
+print(f"Total optimization time: {total_time:.3f} seconds")
