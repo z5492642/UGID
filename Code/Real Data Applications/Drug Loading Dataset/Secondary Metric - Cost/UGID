@@ -1,0 +1,567 @@
+import time
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import scipy.optimize as opt
+from scipy.optimize import minimize
+import warnings
+from pathlib import Path
+
+warnings.filterwarnings('ignore')
+
+start_time = time.time()
+
+# ============================================================
+# 1. LOAD DATA
+# ============================================================
+
+# Scaled dataset used for modelling
+df = pd.read_excel("/content/drug_loading_data_minmax_scaled.xlsx")
+
+feature_cols = [
+    'Crucumin Solubility',
+    'Dipole Moment',
+    'Viscosity',
+    'Dielectric constants',
+    'Hildebrand Solubility Parameters',
+    'Polarity'
+]
+
+X = df[feature_cols]
+x_train = X.to_numpy()
+y_train = np.array(df['EE%']).reshape(-1, 1)
+
+np.random.seed(123)
+
+# ============================================================
+# 2. OPTIONAL: LOAD ORIGINAL-SCALE DATA FOR BACK-TRANSFORMATION
+# ============================================================
+
+orig_path = Path("/content/drug loading data original scale - EE New.xlsx")
+orig_df = pd.read_excel(orig_path)
+
+col_min = orig_df[feature_cols].min().to_numpy()
+col_max = orig_df[feature_cols].max().to_numpy()
+
+def inverse_min_max(x_scaled, vmin=col_min, vmax=col_max):
+    """
+    Convert scaled values in [0,1]^d back to original units.
+    """
+    x_scaled = np.asarray(x_scaled, dtype=float)
+    return x_scaled * (vmax - vmin) + vmin
+
+# ============================================================
+# 3. GPR COMPONENTS
+# ============================================================
+
+def kernel(x1, x2, var_f, lengthscales):
+    """
+    RBF/Gaussian kernel.
+    """
+    if x1.ndim == 1:
+        x1 = x1.reshape(1, -1)
+    if x2.ndim == 1:
+        x2 = x2.reshape(1, -1)
+
+    diff = (x1[:, np.newaxis, :] - x2[np.newaxis, :, :]) ** 2
+    lengthscales = np.array(lengthscales)
+    scaled_diff = diff / (2 * lengthscales**2)
+    pairwise_distances = np.sum(scaled_diff, axis=-1)
+    return var_f * np.exp(-pairwise_distances)
+
+def gp_regression_noisy(X, y, k, x_star, var_f, var_n, l):
+    """
+    Predictive mean & variance for GPR with noise variance var_n.
+    """
+    y = np.asarray(y).flatten()
+
+    if x_star.ndim == 1:
+        x_star = x_star.reshape(1, -1)
+
+    Kxx = k(X, X, var_f, l) + var_n * np.eye(X.shape[0])
+    Lxx = np.linalg.cholesky(Kxx)
+    a = np.linalg.solve(Lxx.T, np.linalg.solve(Lxx, y))
+
+    Kxs = k(X, x_star, var_f, l)
+    mu = Kxs.T @ a
+
+    v = np.linalg.solve(Lxx, Kxs)
+    Kss = k(x_star, x_star, var_f, l)
+    var = Kss - v.T @ v
+    var = np.maximum(var, 1e-12)
+
+    return mu, var
+
+def f_opt(params, *args):
+    """
+    Negative log marginal likelihood objective for L-BFGS.
+    params = [var_f, l1, l2, ..., var_n]
+    """
+    X, y, k = args
+    y = np.asarray(y).flatten()
+
+    var_f = params[0]
+    var_n = params[-1]
+    lengthscales = params[1:-1]
+
+    Kxx = k(X, X, var_f, lengthscales) + var_n * np.eye(X.shape[0])
+    Kxx = Kxx + 1e-8 * np.eye(X.shape[0])
+
+    Lxx = np.linalg.cholesky(Kxx)
+    a = np.linalg.solve(Lxx.T, np.linalg.solve(Lxx, y))
+
+    n = X.shape[0]
+    logdetK = 2.0 * np.sum(np.log(np.diag(Lxx)))
+    return 0.5 * y.T @ a + 0.5 * logdetK + 0.5 * n * np.log(2.0 * np.pi)
+
+# ============================================================
+# 4. UGID HELPERS
+# ============================================================
+
+def sample_from_unit_cube(n_samples, n_features=6, seed=123):
+    np.random.seed(seed)
+    return np.random.uniform(0, 1, (n_samples, n_features))
+
+def evaluate_particles_with_prediction(particles, gpr_params):
+    """
+    Evaluate GPR mean prediction for each particle.
+    """
+    X_sample, Y_sample, kernel_func, var_f, var_n, l = gpr_params
+    preds = []
+
+    for p in particles:
+        mu, var = gp_regression_noisy(
+            X_sample, Y_sample, kernel_func,
+            np.array([p]), var_f, var_n, l
+        )
+        preds.append(mu[0])
+
+    return np.array(preds).flatten()
+
+def evaluate_particles_with_sd(particles, gpr_params):
+    """
+    Optional helper if you still want predictive SD for comparison only.
+    """
+    X_sample, Y_sample, kernel_func, var_f, var_n, l = gpr_params
+    preds = []
+    stds = []
+
+    for p in particles:
+        mu, var = gp_regression_noisy(
+            X_sample, Y_sample, kernel_func,
+            np.array([p]), var_f, var_n, l
+        )
+        preds.append(mu[0])
+        stds.append(np.sqrt(var[0, 0]))
+
+    return np.array(preds).flatten(), np.array(stds).flatten()
+
+def objective_function(x, gpr_params, y_target):
+    """
+    Primary objective = (GP mean at x - y_target)^2
+    """
+    X_sample, Y_sample, kernel_func, var_f, var_n, l = gpr_params
+    mu, var = gp_regression_noisy(
+        X_sample, Y_sample, kernel_func,
+        np.array([x]), var_f, var_n, l
+    )
+    return float((mu[0] - y_target) ** 2)
+
+# ============================================================
+# 5. COST FUNCTION (SECONDARY METRIC)
+# ============================================================
+
+def compute_cost_score(particles, cost_weights=None):
+    """
+    Proxy cost score:
+        C(x) = sum_j w_j * x_j
+
+    x_j are scaled inputs in [0,1].
+    """
+    particles = np.asarray(particles, dtype=float)
+
+    if particles.ndim == 1:
+        particles = particles.reshape(1, -1)
+
+    if cost_weights is None:
+        # Example weights: adjust if you want a different practical interpretation
+        cost_weights = np.array([1.2, 1.0, 1.5, 0.8, 1.1, 0.9])
+
+    costs = particles @ cost_weights
+    return costs.flatten()
+
+def compute_weights(secondary_values, beta):
+    """
+    Compute normalized weights from the secondary metric.
+    """
+    w = np.exp(-beta * secondary_values)
+    return w / np.sum(w)
+
+def resample_with_noise(particles, weights, covariance_matrix_noise):
+    """
+    Resample particles with replacement and add Gaussian noise.
+    """
+    weights = np.array(weights).flatten()
+    n_particles = particles.shape[0]
+    n_features = particles.shape[1]
+
+    weights /= np.sum(weights)
+
+    resampled_indices = np.random.choice(
+        np.arange(n_particles), size=n_particles, p=weights
+    )
+    resampled_particles = particles[resampled_indices]
+
+    noise = np.random.multivariate_normal(
+        mean=np.zeros(n_features),
+        cov=covariance_matrix_noise,
+        size=n_particles
+    )
+    noisy_particles = resampled_particles + noise
+    noisy_particles = np.clip(noisy_particles, 0, 1)
+
+    return noisy_particles
+
+def find_beta_with_lbfgs(secondary_values, target_fraction, top_percent):
+    """
+    Adaptively choose beta using the secondary metric values.
+    """
+    vals_sorted = np.sort(secondary_values)
+    n = len(vals_sorted)
+    m = max(1, int(np.floor(top_percent * n)))
+
+    def objective(beta_arr):
+        beta_val = beta_arr[0] if not np.isscalar(beta_arr) else beta_arr
+        numerator = np.sum(np.exp(-beta_val * vals_sorted[:m]))
+        denominator = np.sum(np.exp(-beta_val * vals_sorted))
+        fraction_val = numerator / (denominator + 1e-14)
+        return (fraction_val - target_fraction) ** 2
+
+    res = opt.minimize(
+        objective, x0=[1.0], method='L-BFGS-B', bounds=[(0, None)]
+    )
+    return res.x[0]
+
+# ============================================================
+# 6. UGID WITH COST AS SECONDARY METRIC
+# ============================================================
+
+def ugid_with_cost_secondary(
+    X_sample, Y_sample, kernel_func,
+    y_target=15.0,
+    K1=1000,
+    K2=100,
+    random_seed=123,
+    n_iterations=200,
+    alpha=0.05,
+    cost_weights=None
+):
+    """
+    UGID with:
+      Primary metric   = (mu(x) - y_target)^2
+      Secondary metric = cost score C(x)
+    """
+
+    x0 = [1.0, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.01]
+    bounds = [(1e-3, None)] + [(1e-3, 1.0)] * 6 + [(1e-5, None)]
+    args = (X_sample, Y_sample, kernel_func)
+
+    res = opt.fmin_l_bfgs_b(
+        f_opt, x0, args=args, approx_grad=True, bounds=bounds
+    )
+
+    var_f_optimized = res[0][0]
+    l_optimized = res[0][1:-1]
+    var_n_optimized = res[0][-1]
+
+    cost_step5_all_iterations = []
+    cost_step10_all_iterations = []
+    step5_particles_all = []
+    final_particles_all = []
+    beta_all = []
+
+    np.random.seed(random_seed)
+
+    for iter_idx in range(n_iterations):
+        # Step 1: sample K1 points
+        particles = sample_from_unit_cube(
+            K1, n_features=6, seed=random_seed + iter_idx
+        )
+
+        # Step 2/3: evaluate primary objective and select top K2
+        preds = evaluate_particles_with_prediction(
+            particles,
+            (X_sample, Y_sample, kernel_func, var_f_optimized, var_n_optimized, l_optimized)
+        )
+        errors = (preds - y_target) ** 2
+        sorted_idx = np.argsort(errors)
+        topK_idx = sorted_idx[:K2]
+        topK_particles = particles[topK_idx]
+
+        # Step 4: local optimization on primary objective
+        for i in range(K2):
+            x0_opt = topK_particles[i]
+            res_local = minimize(
+                objective_function,
+                x0_opt,
+                args=((X_sample, Y_sample, kernel_func, var_f_optimized, var_n_optimized, l_optimized),
+                      y_target),
+                bounds=[(0, 1)] * topK_particles.shape[1],
+                method='L-BFGS-B'
+            )
+            topK_particles[i] = res_local.x
+
+        # Step 5: evaluate cost instead of uncertainty
+        cost_step_5 = compute_cost_score(topK_particles, cost_weights=cost_weights)
+        cost_step5_all_iterations.append(cost_step_5)
+        step5_particles_all.append(topK_particles)
+
+        # Step 7: choose beta from cost values
+        beta = find_beta_with_lbfgs(
+            cost_step_5, target_fraction=0.9, top_percent=0.2
+        )
+        beta_all.append(beta)
+        print(f'Value for Beta at iteration {iter_idx+1}: {beta:.6f}')
+
+        # Step 8: compute weights from cost
+        w = compute_weights(cost_step_5, beta)
+
+        # Step 9: covariance and resample
+        if K2 > 1:
+            cov_mat = np.cov(topK_particles, rowvar=False)
+        else:
+            cov_mat = np.eye(6) * 1e-8
+
+        cov_mat_noise = alpha * cov_mat
+        noisy_particles = resample_with_noise(topK_particles, w, cov_mat_noise)
+
+        # Re-optimize primary objective
+        for i in range(K2):
+            x0_opt = noisy_particles[i]
+            res_local = minimize(
+                objective_function,
+                x0_opt,
+                args=((X_sample, Y_sample, kernel_func, var_f_optimized, var_n_optimized, l_optimized),
+                      y_target),
+                bounds=[(0, 1)] * noisy_particles.shape[1],
+                method='L-BFGS-B'
+            )
+            noisy_particles[i] = res_local.x
+
+        # Step 10: evaluate cost again
+        cost_step_10 = compute_cost_score(noisy_particles, cost_weights=cost_weights)
+        cost_step10_all_iterations.append(cost_step_10)
+        final_particles_all.append(noisy_particles)
+
+    return (
+        final_particles_all,
+        var_f_optimized, l_optimized, var_n_optimized,
+        cost_step5_all_iterations, cost_step10_all_iterations,
+        step5_particles_all,
+        beta_all
+    )
+
+# ============================================================
+# 7. RUN COST-BASED UGID
+# ============================================================
+
+# Example target
+y_target = 15.0
+
+# Example practical burden / proxy cost weights
+# You can modify these if you want a different interpretation
+cost_weights = np.array([1.2, 1.0, 1.5, 0.8, 1.1, 0.9])
+
+(
+    final_particles_all,
+    var_f, ls, var_n,
+    cost_step5_all, cost_step10_all,
+    step5_particles_all,
+    beta_all
+) = ugid_with_cost_secondary(
+    X_sample=x_train,
+    Y_sample=y_train,
+    kernel_func=kernel,
+    y_target=y_target,
+    K1=1000,
+    K2=100,
+    random_seed=123,
+    n_iterations=200,
+    alpha=0.05,
+    cost_weights=cost_weights
+)
+
+gpr_params = (x_train, y_train, kernel, var_f, var_n, ls)
+
+# ============================================================
+# 8. PLOT MIN COST: STAGE 1 VS STAGE 2
+# ============================================================
+
+n_iterations = len(cost_step5_all)
+min_cost_step5 = [np.min(cost_step5_all[i]) for i in range(n_iterations)]
+min_cost_step10 = [np.min(cost_step10_all[i]) for i in range(n_iterations)]
+
+plt.figure(figsize=(9, 7))
+plt.scatter(min_cost_step5, min_cost_step10, color='blue', alpha=0.7, label='Replications')
+
+min_val = min(min_cost_step5 + min_cost_step10)
+max_val = max(min_cost_step5 + min_cost_step10)
+line_vals = np.linspace(min_val, max_val, 100)
+
+plt.plot(line_vals, line_vals, 'r--', label='y = x')
+plt.xlabel("Minimum Cost (Stage 1)", fontsize=16, labelpad=12)
+plt.ylabel("Minimum Cost (Stage 2)", fontsize=16, labelpad=12)
+plt.tick_params(axis='both', which='major', labelsize=16, pad=12)
+plt.xticks(rotation=30)
+plt.grid(False)
+plt.legend(fontsize=16)
+plt.show()
+
+plt.figure(figsize=(9, 7))
+sns.histplot(data=min_cost_step5, kde=False, color='blue')
+plt.xlabel("Minimum Cost (Stage 1)", fontsize=16, labelpad=12)
+plt.ylabel("frequency", fontsize=16, labelpad=12)
+plt.tick_params(axis='both', which='major', labelsize=16, pad=12)
+plt.xticks(rotation=30)
+plt.show()
+
+plt.figure(figsize=(9, 7))
+sns.histplot(data=min_cost_step10, kde=False, color='blue')
+plt.xlabel("Minimum Cost (Stage 2)", fontsize=16, labelpad=12)
+plt.ylabel("frequency", fontsize=16, labelpad=12)
+plt.tick_params(axis='both', which='major', labelsize=16, pad=12)
+plt.xticks(rotation=30)
+plt.show()
+
+# ============================================================
+# 9. SELECT FINAL SOLUTION BY MINIMUM COST
+# ============================================================
+
+best_particle_predictions = []
+best_particle_costs = []
+best_final_particles = []
+
+for i in range(n_iterations):
+    particles_i = final_particles_all[i]
+
+    preds_i = evaluate_particles_with_prediction(particles_i, gpr_params)
+    costs_i = compute_cost_score(particles_i, cost_weights=cost_weights)
+
+    idx_min_cost = np.argmin(costs_i)
+
+    best_particle_predictions.append(preds_i[idx_min_cost])
+    best_particle_costs.append(costs_i[idx_min_cost])
+    best_final_particles.append(particles_i[idx_min_cost])
+
+best_particle_predictions = np.array(best_particle_predictions)
+best_particle_costs = np.array(best_particle_costs)
+best_final_particles = np.array(best_final_particles)
+
+# ============================================================
+# 10. SUMMARY STATISTICS
+# ============================================================
+
+mean_best_pred = np.mean(best_particle_predictions)
+sd_best_pred = np.std(best_particle_predictions, ddof=1)
+se_best_pred = sd_best_pred / np.sqrt(len(best_particle_predictions))
+
+print(f"Mean of the best predicted responses = {mean_best_pred:.4f}")
+print(f"Standard error of the best predicted responses = {se_best_pred:.4f}")
+
+mean_best_cost = np.mean(best_particle_costs)
+sd_best_cost = np.std(best_particle_costs, ddof=1)
+se_best_cost = sd_best_cost / np.sqrt(len(best_particle_costs))
+
+print(f"Mean of the cost score of the best solutions = {mean_best_cost:.4f}")
+print(f"Standard error of the cost score of the best solutions = {se_best_cost:.4f}")
+
+# ============================================================
+# 11. PLOT PREDICTED RESPONSE VS COST
+# ============================================================
+
+plt.figure(figsize=(9, 7))
+plt.scatter(best_particle_costs, best_particle_predictions)
+plt.ticklabel_format(useOffset=False, style='plain', axis='y')
+plt.axhline(y=y_target, color='r', linestyle='--', label=f'Target={y_target}')
+plt.xlabel("Cost score of selected solution", fontsize=16, labelpad=12)
+plt.ylabel("Predicted value of selected solution", fontsize=16, labelpad=12)
+plt.xlim(0.4,2.5)
+plt.ylim(14.8,15.2)
+plt.tick_params(axis='both', which='major', labelsize=16, pad=12)
+plt.xticks(rotation=30)
+plt.legend()
+plt.grid(False)
+plt.show()
+
+# ============================================================
+# 12. PLOT ALL FINAL SOLUTIONS
+# ============================================================
+
+all_final_solutions = []
+all_final_costs = []
+
+for i in range(n_iterations):
+    final_points_i = final_particles_all[i]
+    costs_i = compute_cost_score(final_points_i, cost_weights=cost_weights)
+
+    all_final_solutions.append(final_points_i)
+    all_final_costs.append(costs_i)
+
+all_final_solutions = np.vstack(all_final_solutions)
+all_final_costs = np.hstack(all_final_costs)
+
+feature_names = [f"x{i+1}" for i in range(all_final_solutions.shape[1])]
+df_all_final_solutions = pd.DataFrame(all_final_solutions, columns=feature_names)
+df_best_final_solutions = pd.DataFrame(best_final_particles, columns=feature_names)
+
+sns.pairplot(df_all_final_solutions, diag_kind="hist", corner=True)
+plt.suptitle("Pairwise Scatter Plots of All Final Solutions", y=1.02, fontsize=16)
+plt.show()
+
+sns.pairplot(df_best_final_solutions, diag_kind="hist", corner=True)
+plt.suptitle("Pairwise Scatter Plots of Best Final Cost-Selected Solutions", y=1.02, fontsize=16)
+plt.show()
+
+# ============================================================
+# 13. BACK-TRANSFORM BEST FINAL SOLUTIONS TO ORIGINAL UNITS
+# ============================================================
+
+best_final_particles_orig = inverse_min_max(best_final_particles)
+
+best_final_particles_orig_df = pd.DataFrame(
+    best_final_particles_orig,
+    columns=feature_cols
+)
+
+print("\nBest final particles in original units:")
+print(best_final_particles_orig_df.round(4))
+
+# Save if needed
+best_final_particles_orig_df.to_csv(
+    "dataset1_cost_selected_solutions_original_units.csv",
+    index=False
+)
+
+# ============================================================
+# 14. OPTIONAL: SAVE REPLICATION-LEVEL SUMMARY
+# ============================================================
+
+replication_summary_df = pd.DataFrame({
+    "replication": np.arange(1, n_iterations + 1),
+    "predicted_response": best_particle_predictions,
+    "cost_score": best_particle_costs,
+    "beta": beta_all
+})
+
+replication_summary_df.to_csv(
+    "dataset1_cost_secondary_replication_summary.csv",
+    index=False
+)
+
+print("\nReplication-level summary:")
+print(replication_summary_df.head())
+
+end_time = time.time()
+total_time = end_time - start_time
+print(f"\nTotal optimization time: {total_time:.3f} seconds")
