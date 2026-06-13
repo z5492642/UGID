@@ -1,0 +1,441 @@
+import time
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import scipy.optimize as opt
+from scipy.optimize import minimize
+import warnings
+from pathlib import Path
+
+warnings.filterwarnings('ignore')
+
+start_time = time.time()
+
+# ============================================================
+# 1. LOAD DATA
+# ============================================================
+
+df = pd.read_excel("/content/drug_loading_data_minmax_scaled.xlsx")
+
+feature_cols = [
+    'Crucumin Solubility',
+    'Dipole Moment',
+    'Viscosity',
+    'Dielectric constants',
+    'Hildebrand Solubility Parameters',
+    'Polarity'
+]
+
+X = df[feature_cols]
+x_train = X.to_numpy()
+y_train = np.array(df['EE%']).reshape(-1, 1)
+
+np.random.seed(123)
+
+# ============================================================
+# 2. KERNEL AND GPR
+# ============================================================
+
+def kernel(x1, x2, var_f, l):
+    l = np.array(l)
+
+    if x1.ndim == 1:
+        x1 = x1.reshape(1, -1)
+    if x2.ndim == 1:
+        x2 = x2.reshape(1, -1)
+
+    diff = (x1[:, np.newaxis, :] - x2[np.newaxis, :, :]) ** 2
+    scaled_diff = diff / (2 * l**2)
+    pairwise_distances = np.sum(scaled_diff, axis=-1)
+
+    return var_f * np.exp(-pairwise_distances)
+
+def gp_regression_noisy(X, y, k, x_star, var_f, var_n, l):
+    Kxx = k(X, X, var_f, l) + var_n * np.eye(X.shape[0])
+    Lxx = np.linalg.cholesky(Kxx)
+    a = np.linalg.solve(Lxx.T, np.linalg.solve(Lxx, y))
+
+    Kxs = k(X, x_star, var_f, l)
+    mu = Kxs.T @ a
+
+    v = np.linalg.solve(Lxx, Kxs)
+    Kss = k(x_star, x_star, var_f, l)
+    var = Kss - v.T @ v
+
+    return mu, var
+
+def f_opt(params, *args):
+    X, y, k = args
+    var_f = params[0]
+    var_n = params[-1]
+    lengthscales = params[1:-1]
+
+    Kxx = k(X, X, var_f, lengthscales) + var_n * np.eye(X.shape[0])
+    Lxx = np.linalg.cholesky(Kxx)
+    a = np.linalg.solve(Lxx.T, np.linalg.solve(Lxx, y))
+
+    n = X.shape[0]
+    logdetK = 2.0 * np.sum(np.log(np.diag(Lxx)))
+
+    return 0.5 * y.T @ a + 0.5 * logdetK + 0.5 * n * np.log(2.0 * np.pi)
+
+def evaluate_particles_with_sd(particles, gpr_params):
+    X_sample, Y_sample, kernel_func, var_f, var_n, l = gpr_params
+    preds = []
+    stds = []
+    for p in particles:
+        mu, var = gp_regression_noisy(
+            X_sample, Y_sample, kernel_func,
+            np.array([p]), var_f, var_n, l
+        )
+        preds.append(float(mu[0]))
+        stds.append(float(np.sqrt(max(var[0, 0], 0.0))))
+    return np.array(preds), np.array(stds)
+
+# ============================================================
+# 3. COST FUNCTION
+# ============================================================
+
+# User-specified positive weights for cost proxy
+# You can change these if you want to emphasize certain variables more.
+cost_weights = np.array([1.0, 1.0, 1.2, 1.0, 1.1, 0.9])
+
+def cost_function(x, weights=cost_weights):
+    """
+    Weighted linear cost proxy using min-max scaled inputs.
+    Since x is already scaled to [0,1], larger values imply larger cost burden.
+    """
+    x = np.asarray(x).flatten()
+    return np.sum(weights * x)
+
+# ============================================================
+# 4. SINGLE-OBJECTIVE FUNCTION WITH COST AS SECONDARY METRIC
+# ============================================================
+
+def objective_function_cost(x, gpr_params, y_target, alpha_cost=1.0):
+    """
+    Objective = (GP mean at x - y_target)^2 + alpha_cost * cost(x)
+
+    Primary objective: match target response
+    Secondary objective: reduce cost proxy
+    """
+    X_sample, Y_sample, kernel_func, var_f, var_n, l = gpr_params
+    mu, var = gp_regression_noisy(
+        X_sample, Y_sample, kernel_func,
+        np.array([x]), var_f, var_n, l
+    )
+
+    primary_term = (mu[0] - y_target) ** 2
+    secondary_term = cost_function(x)
+
+    return primary_term + alpha_cost * secondary_term
+
+# ============================================================
+# 5. PSO
+# ============================================================
+
+def run_pso(
+    init_positions,
+    gpr_params,
+    y_target,
+    alpha_cost=1.0,
+    n_steps=20,
+    w=0.5,
+    c1=1.0,
+    c2=1.0,
+    seed=123
+):
+    np.random.seed(seed)
+    n_particles = init_positions.shape[0]
+
+    positions = init_positions.copy()
+    velocities = np.zeros_like(positions)
+
+    fitness = np.array([
+        objective_function_cost(pos, gpr_params, y_target, alpha_cost)
+        for pos in positions
+    ])
+
+    personal_best_positions = positions.copy()
+    personal_best_fitness = fitness.copy()
+
+    gbest_idx = np.argmin(personal_best_fitness)
+    global_best_position = personal_best_positions[gbest_idx].copy()
+    global_best_fitness = personal_best_fitness[gbest_idx]
+
+    for step in range(n_steps):
+        for i in range(n_particles):
+            r1, r2 = np.random.rand(), np.random.rand()
+
+            velocities[i] = (
+                w * velocities[i]
+                + c1 * r1 * (personal_best_positions[i] - positions[i])
+                + c2 * r2 * (global_best_position - positions[i])
+            )
+
+            positions[i] += velocities[i]
+            positions[i] = np.clip(positions[i], 0, 1)
+
+            fit_val = objective_function_cost(
+                positions[i], gpr_params, y_target, alpha_cost
+            )
+
+            if fit_val < personal_best_fitness[i]:
+                personal_best_positions[i] = positions[i].copy()
+                personal_best_fitness[i] = fit_val
+
+        gbest_idx = np.argmin(personal_best_fitness)
+        if personal_best_fitness[gbest_idx] < global_best_fitness:
+            global_best_position = personal_best_positions[gbest_idx].copy()
+            global_best_fitness = personal_best_fitness[gbest_idx]
+
+    return global_best_position
+
+# ============================================================
+# 6. INITIAL PARTICLE GENERATION
+# ============================================================
+
+def sample_particles_from_training_data(training_data, K1, seed=123):
+    np.random.seed(seed)
+    n_train = training_data.shape[0]
+
+    if K1 <= n_train:
+        idxs = np.random.choice(n_train, K1, replace=False)
+    else:
+        idxs = np.random.choice(n_train, K1, replace=True)
+
+    particles = training_data[idxs].copy()
+    particles += 0.01 * (np.random.rand(*particles.shape) - 0.5)
+    particles = np.clip(particles, 0, 1)
+
+    return particles
+
+# ============================================================
+# 7. MAIN OPTIMIZATION ROUTINE
+# ============================================================
+
+def inverse_regression_single_objective_cost(
+    X_sample, Y_sample, kernel_func,
+    y_target,
+    K1=1000,
+    random_seed=123,
+    n_iterations=200,
+    pso_steps=20,
+    alpha_cost=1.0
+):
+    # GP hyperparameter optimization
+    x0 = [1.0] + [0.5] * 6 + [0.01]
+    bounds = [(1e-3, None)] + [(1e-3, 1.0)] * 6 + [(1e-5, None)]
+    args = (X_sample, Y_sample, kernel_func)
+
+    res = opt.fmin_l_bfgs_b(
+        f_opt, x0, args=args, approx_grad=True, bounds=bounds
+    )
+
+    var_f_optimized = res[0][0]
+    var_n_optimized = res[0][-1]
+    l_optimized = res[0][1:-1]
+
+    gpr_params = (
+        X_sample, Y_sample, kernel_func,
+        var_f_optimized, var_n_optimized, l_optimized
+    )
+
+    best_solutions_each_iter = []
+    best_solutions_pred_each_iter = []
+    best_solutions_std_each_iter = []
+    best_solutions_cost_each_iter = []
+
+    for iter_idx in range(n_iterations):
+        init_particles = sample_particles_from_training_data(
+            X_sample, K1, seed=(random_seed + iter_idx)
+        )
+
+        best_sol = run_pso(
+            init_positions=init_particles,
+            gpr_params=gpr_params,
+            y_target=y_target,
+            alpha_cost=alpha_cost,
+            n_steps=pso_steps,
+            w=0.5,
+            c1=1.0,
+            c2=1.0,
+            seed=(random_seed + iter_idx)
+        )
+
+        pred, std_ = evaluate_particles_with_sd(np.array([best_sol]), gpr_params)
+        cost_val = cost_function(best_sol)
+
+        best_solutions_each_iter.append(best_sol)
+        best_solutions_pred_each_iter.append(pred[0])
+        best_solutions_std_each_iter.append(std_[0])
+        best_solutions_cost_each_iter.append(cost_val)
+
+    return (
+        var_f_optimized,
+        l_optimized,
+        var_n_optimized,
+        np.array(best_solutions_each_iter),
+        np.array(best_solutions_pred_each_iter),
+        np.array(best_solutions_std_each_iter),
+        np.array(best_solutions_cost_each_iter)
+    )
+
+# ============================================================
+# 8. RUN ANALYSIS
+# ============================================================
+
+y_target = 15.0
+
+(var_f, l, var_n,
+ best_solutions_each_iter,
+ best_particle_predictions,
+ best_particle_stds,
+ best_particle_costs
+) = inverse_regression_single_objective_cost(
+    X_sample=x_train,
+    Y_sample=y_train,
+    kernel_func=kernel,
+    y_target=y_target,
+    K1=1000,
+    random_seed=123,
+    n_iterations=200,
+    pso_steps=20,
+    alpha_cost=0.2   # tune this if needed
+)
+
+gpr_params = (x_train, y_train, kernel, var_f, var_n, l)
+
+# ============================================================
+# 9. NUMERICAL SUMMARIES
+# ============================================================
+
+def mean_and_se(arr):
+    arr = np.asarray(arr)
+    return np.mean(arr), np.std(arr, ddof=1) / np.sqrt(len(arr))
+
+mean_pred, se_pred = mean_and_se(best_particle_predictions)
+mean_std, se_std = mean_and_se(best_particle_stds)
+mean_cost, se_cost = mean_and_se(best_particle_costs)
+
+print(f"Mean predicted response = {mean_pred:.6f}")
+print(f"SE predicted response   = {se_pred:.6f}")
+print(f"Mean predicted SD       = {mean_std:.6f}")
+print(f"SE predicted SD         = {se_std:.6f}")
+print(f"Mean cost score         = {mean_cost:.6f}")
+print(f"SE cost score           = {se_cost:.6f}")
+
+# ============================================================
+# 10. PLOT: PREDICTED RESPONSE VS COST
+# ============================================================
+
+plt.figure(figsize=(9, 7))
+plt.scatter(best_particle_costs, best_particle_predictions, alpha=0.8, edgecolors='k')
+plt.axhline(y=y_target, color='r', linestyle='--', label=f'Target = {y_target}')
+plt.xlabel("Cost score of proposed solution", fontsize=16, labelpad=12)
+plt.ylabel("Predicted value of proposed solution", fontsize=16, labelpad=12)
+plt.ylim(14.8,15.2)
+plt.tick_params(axis='both', which='major', labelsize=16, pad=12)
+plt.legend(fontsize=14)
+plt.grid(False)
+plt.show()
+
+# ============================================================
+# 11. PLOT: COST SCORE ACROSS REPLICATIONS
+# ============================================================
+
+plt.figure(figsize=(9, 7))
+plt.scatter(np.arange(len(best_particle_costs)), best_particle_costs, alpha=0.8, edgecolors='k')
+plt.xlabel("Replication", fontsize=16, labelpad=12)
+plt.ylabel("Cost score of proposed solution", fontsize=16, labelpad=12)
+plt.tick_params(axis='both', which='major', labelsize=16, pad=12)
+plt.grid(False)
+plt.show()
+
+# ============================================================
+# 12. PLOT: SELECTED SOLUTIONS IN SCALED INPUT SPACE
+# ============================================================
+
+import seaborn as sns
+
+feature_names = [f"x{i+1}" for i in range(best_solutions_each_iter.shape[1])]
+df_best_solutions = pd.DataFrame(best_solutions_each_iter, columns=feature_names)
+
+g = sns.pairplot(df_best_solutions, diag_kind="hist", corner=True)
+for ax in g.axes.flatten():
+    if ax is not None:
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+plt.suptitle("Pairwise Scatter Plots of Cost-Constrained Final Solutions", y=1.02, fontsize=16)
+plt.show()
+
+# ============================================================
+# 13. CONVERT BEST SOLUTIONS BACK TO ORIGINAL SCALE
+# ============================================================
+
+orig_path = Path("/content/drug loading data original scale - EE New.xlsx")
+orig_df = pd.read_excel(orig_path)
+
+orig_feature_cols = [
+    "Crucumin Solubility",
+    "Dipole Moment",
+    "Viscosity",
+    "Dielectric constants",
+    "Hildebrand Solubility Parameters",
+    "Polarity",
+]
+
+col_min = orig_df[orig_feature_cols].min().to_numpy()
+col_max = orig_df[orig_feature_cols].max().to_numpy()
+
+def inverse_min_max(x_scaled, vmin=col_min, vmax=col_max):
+    x_scaled = np.asarray(x_scaled, dtype=float)
+    return x_scaled * (vmax - vmin) + vmin
+
+best_solution_orig = inverse_min_max(best_solutions_each_iter[0])
+
+best_solution_df = pd.DataFrame(
+    best_solution_orig.reshape(1, -1),
+    columns=orig_feature_cols,
+    index=["Best solution (original scale)"]
+)
+
+print("\nBest solution in original units:")
+print(best_solution_df.round(4))
+
+# ============================================================
+# 14. SAVE RESULTS
+# ============================================================
+
+results_df = pd.DataFrame(best_solutions_each_iter, columns=orig_feature_cols)
+results_df["predicted_EE"] = best_particle_predictions
+results_df["predicted_sd"] = best_particle_stds
+results_df["cost_score"] = best_particle_costs
+
+results_df.to_csv("dataset1_single_objective_cost_results_scaled.csv", index=False)
+
+results_orig_df = pd.DataFrame(
+    inverse_min_max(best_solutions_each_iter),
+    columns=orig_feature_cols
+)
+results_orig_df["predicted_EE"] = best_particle_predictions
+results_orig_df["predicted_sd"] = best_particle_stds
+results_orig_df["cost_score"] = best_particle_costs
+
+results_orig_df.to_csv("dataset1_single_objective_cost_results_original_scale.csv", index=False)
+
+end_time = time.time()
+total_time = end_time - start_time
+print(f"\nTotal optimization time: {total_time:.3f} seconds")
+
+plt.figure(figsize=(9, 7))
+plt.scatter(best_particle_costs, best_particle_predictions, alpha=0.8, edgecolors='k')
+plt.axhline(y=y_target, color='r', linestyle='--', label=f'Target = {y_target}')
+plt.xlabel("Cost score of proposed solution", fontsize=16, labelpad=12)
+plt.ylabel("Predicted value of proposed solution", fontsize=16, labelpad=12)
+plt.xlim(0.4,2.5)
+plt.ylim(14.8,15.2)
+plt.tick_params(axis='both', which='major', labelsize=16, pad=12)
+plt.legend(fontsize=14)
+plt.grid(False)
+plt.show()
