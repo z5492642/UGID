@@ -1,0 +1,550 @@
+import time
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import scipy.optimize as opt
+from pathlib import Path
+import warnings
+warnings.filterwarnings('ignore')
+
+!pip install pymoo
+
+from pymoo.problems.functional import FunctionalProblem
+from pymoo.algorithms.moo.nsga2 import NSGA2
+from pymoo.termination import get_termination
+from pymoo.optimize import minimize
+from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
+
+start_time = time.time()
+
+# ============================================================
+# 1. LOAD DATA
+# ============================================================
+
+df = pd.read_excel("/content/drug_loading_data_minmax_scaled.xlsx")
+
+feature_cols = [
+    'Crucumin Solubility',
+    'Dipole Moment',
+    'Viscosity',
+    'Dielectric constants',
+    'Hildebrand Solubility Parameters',
+    'Polarity'
+]
+
+X = df[feature_cols]
+x_train = X.to_numpy()
+y_train = np.array(df['EE%']).reshape(-1, 1)
+
+np.random.seed(123)
+
+# ============================================================
+# 2. KERNEL AND GPR
+# ============================================================
+
+def kernel(x1, x2, var_f, l):
+    l = np.array(l)
+
+    if x1.ndim == 1:
+        x1 = x1.reshape(1, -1)
+    if x2.ndim == 1:
+        x2 = x2.reshape(1, -1)
+
+    diff = (x1[:, np.newaxis, :] - x2[np.newaxis, :, :]) ** 2
+    scaled_diff = diff / (2 * l**2)
+    pairwise_distances = np.sum(scaled_diff, axis=-1)
+
+    return var_f * np.exp(-pairwise_distances)
+
+
+def gp_regression_noisy(X, y, k, x_star, var_f, var_n, l):
+    if x_star.ndim == 1:
+        x_star = x_star.reshape(1, -1)
+
+    Kxx = k(X, X, var_f, l) + var_n * np.eye(X.shape[0])
+    Lxx = np.linalg.cholesky(Kxx)
+    a = np.linalg.solve(Lxx.T, np.linalg.solve(Lxx, y))
+
+    Kxs = k(X, x_star, var_f, l)
+    mu = Kxs.T @ a
+
+    v = np.linalg.solve(Lxx, Kxs)
+    Kss = k(x_star, x_star, var_f, l)
+    var = Kss - v.T @ v
+
+    return mu, var
+
+
+def f_opt(params, *args):
+    X, y, k = args
+    var_f = params[0]
+    var_n = params[-1]
+    lengthscales = params[1:-1]
+
+    Kxx = k(X, X, var_f, lengthscales) + var_n * np.eye(X.shape[0])
+    Lxx = np.linalg.cholesky(Kxx)
+    a = np.linalg.solve(Lxx.T, np.linalg.solve(Lxx, y))
+
+    n = X.shape[0]
+    logdetK = 2.0 * np.sum(np.log(np.diag(Lxx)))
+
+    return 0.5 * y.T @ a + 0.5 * logdetK + 0.5 * n * np.log(2.0 * np.pi)
+
+
+def evaluate_particles_with_sd(particles, gpr_params):
+    X_sample, Y_sample, kernel_func, var_f, var_n, l = gpr_params
+    preds = []
+    stds = []
+
+    particles = np.asarray(particles)
+    if particles.ndim == 1:
+        particles = particles.reshape(1, -1)
+
+    for p in particles:
+        mu, var = gp_regression_noisy(
+            X_sample, Y_sample, kernel_func,
+            np.array([p]), var_f, var_n, l
+        )
+        preds.append(float(mu[0]))
+        stds.append(float(np.sqrt(max(var[0, 0], 0.0))))
+
+    return np.array(preds), np.array(stds)
+
+# ============================================================
+# 3. COST FUNCTION
+# ============================================================
+
+cost_weights = np.array([1.0, 1.0, 1.2, 1.0, 1.1, 0.9])
+
+def cost_function(x, weights=cost_weights):
+    """
+    Weighted linear cost proxy using scaled inputs.
+    Lower values = lower cost.
+    """
+    x = np.asarray(x)
+    if x.ndim == 1:
+        return float(np.sum(weights * x))
+    return np.sum(weights * x, axis=1)
+
+# ============================================================
+# 4. SAMPLING
+# ============================================================
+
+def sample_from_unit_cube(n_samples, n_features=6, seed=123):
+    np.random.seed(seed)
+    return np.random.uniform(0, 1, (n_samples, n_features))
+
+# ============================================================
+# 5. NSGA-II REFINEMENT WITH COST AS SECOND OBJECTIVE
+# ============================================================
+
+def run_nsga2_refinement_cost(
+    initial_points,
+    X_train, y_train,
+    kernel_func, var_f, var_n, lengthscales,
+    y_target=15.0,
+    n_gen=30,
+    seed=123
+):
+    """
+    Multi-objective optimization:
+      f1(x) = (mu(x) - y_target)^2
+      f2(x) = cost(x)
+    """
+
+    def f1(x):
+        x = np.asarray(x).reshape(1, -1)
+        mu, _ = gp_regression_noisy(
+            X_train, y_train, kernel_func,
+            x, var_f, var_n, lengthscales
+        )
+        return float((mu[0] - y_target) ** 2)
+
+    def f2(x):
+        x = np.asarray(x).reshape(1, -1)
+        return float(cost_function(x))
+
+    problem = FunctionalProblem(
+        n_var=6,
+        objs=[f1, f2],
+        xl=np.zeros(6),
+        xu=np.ones(6)
+    )
+
+    from pymoo.core.population import Population
+    pop_init = Population.new("X", initial_points)
+
+    algorithm = NSGA2(
+        pop_size=len(initial_points),
+        sampling=pop_init
+    )
+
+    termination = get_termination("n_gen", n_gen)
+
+    res = minimize(
+        problem,
+        algorithm,
+        termination,
+        seed=seed,
+        verbose=False
+    )
+
+    return res.X, res.F
+
+# ============================================================
+# 6. MAIN MULTI-OBJECTIVE ROUTINE
+# ============================================================
+
+def inverse_regression_multiobj_cost(
+    X_sample, Y_sample, kernel_func,
+    y_target=15.0,
+    K1=1000,
+    n_gen_nsga2=20,
+    random_seed=123,
+    n_iterations=200
+):
+    np.random.seed(random_seed)
+
+    x0 = [1.0] + [0.5] * 6 + [0.01]
+    bounds = [(1e-3, None)] + [(1e-3, 1.0)] * 6 + [(1e-5, None)]
+    args = (X_sample, Y_sample, kernel_func)
+
+    res = opt.fmin_l_bfgs_b(
+        f_opt, x0, args=args, approx_grad=True, bounds=bounds
+    )
+
+    var_f_optimized = res[0][0]
+    var_n_optimized = res[0][-1]
+    l_optimized = res[0][1:-1]
+
+    final_solutions_all = []
+    final_obj_all = []
+    pred_sd_all = []
+
+    for iter_idx in range(n_iterations):
+        particles = sample_from_unit_cube(
+            K1, n_features=6, seed=random_seed + iter_idx
+        )
+
+        final_solutions, final_obj = run_nsga2_refinement_cost(
+            initial_points=particles,
+            X_train=X_sample,
+            y_train=Y_sample,
+            kernel_func=kernel_func,
+            var_f=var_f_optimized,
+            var_n=var_n_optimized,
+            lengthscales=l_optimized,
+            y_target=y_target,
+            n_gen=n_gen_nsga2,
+            seed=random_seed + iter_idx
+        )
+
+        _, pred_sd = evaluate_particles_with_sd(
+            final_solutions,
+            (X_sample, Y_sample, kernel_func, var_f_optimized, var_n_optimized, l_optimized)
+        )
+
+        final_solutions_all.append(final_solutions)
+        final_obj_all.append(final_obj)
+        pred_sd_all.append(pred_sd)
+
+    return (
+        var_f_optimized,
+        var_n_optimized,
+        l_optimized,
+        final_solutions_all,
+        final_obj_all,
+        pred_sd_all
+    )
+
+# ============================================================
+# 7. RUN ANALYSIS
+# ============================================================
+
+y_target = 15.0
+target_tol = 0.25   # <-- key change: tolerance band around target
+
+(var_f, var_n, l,
+ final_solutions_all,
+ final_objectives_all,
+ pred_sd_all_iterations) = inverse_regression_multiobj_cost(
+    X_sample=x_train,
+    Y_sample=y_train,
+    kernel_func=kernel,
+    y_target=y_target,
+    K1=1000,
+    random_seed=123,
+    n_iterations=200,
+    n_gen_nsga2=20
+)
+
+gpr_params = (x_train, y_train, kernel, var_f, var_n, l)
+
+# ============================================================
+# 8. EXTRACT PARETO FRONTS
+# ============================================================
+
+nds = NonDominatedSorting()
+
+pareto_solutions_all = []
+pareto_objectives_all = []
+
+n_iterations = len(final_solutions_all)
+
+for i in range(n_iterations):
+    pop_X = final_solutions_all[i]
+    pop_F = final_objectives_all[i]
+
+    non_dom_idx = nds.do(pop_F, only_non_dominated_front=True)
+
+    pareto_solutions_i = pop_X[non_dom_idx]
+    pareto_objectives_i = pop_F[non_dom_idx]
+
+    pareto_solutions_all.append(pareto_solutions_i)
+    pareto_objectives_all.append(pareto_objectives_i)
+
+# ============================================================
+# 9. EVALUATE PARETO SOLUTIONS
+# ============================================================
+
+pareto_predictions_all = []
+pareto_predsd_all = []
+pareto_costs_all = []
+
+for i in range(n_iterations):
+    pareto_solutions_i = pareto_solutions_all[i]
+
+    pred_means_i, pred_stds_i = evaluate_particles_with_sd(
+        pareto_solutions_i, gpr_params
+    )
+    cost_i = cost_function(pareto_solutions_i)
+
+    pareto_predictions_all.append(pred_means_i)
+    pareto_predsd_all.append(pred_stds_i)
+    pareto_costs_all.append(cost_i)
+
+# ============================================================
+# 10. SELECT ONE SOLUTION PER REPLICATION
+# ============================================================
+# New rule:
+# 1) keep Pareto solutions with |pred - target| <= target_tol
+# 2) among them choose minimum cost
+# 3) if none satisfy tolerance, choose closest-to-target solution
+
+selected_solutions = []
+selected_means = []
+selected_pred_sds = []
+selected_costs = []
+selected_target_errors = []
+selection_status = []
+
+for i in range(n_iterations):
+    means_i = pareto_predictions_all[i]
+    sds_i = pareto_predsd_all[i]
+    costs_i = pareto_costs_all[i]
+    sols_i = pareto_solutions_all[i]
+
+    feasible_idx = np.where(np.abs(means_i - y_target) <= target_tol)[0]
+
+    if len(feasible_idx) > 0:
+        idx_sel = feasible_idx[np.argmin(costs_i[feasible_idx])]
+        selection_status.append("within_tolerance")
+    else:
+        idx_sel = np.argmin(np.abs(means_i - y_target))
+        selection_status.append("closest_fallback")
+
+    best_sol = sols_i[idx_sel]
+    best_mean = means_i[idx_sel]
+    best_sd = sds_i[idx_sel]
+    best_cost = costs_i[idx_sel]
+    best_err = np.abs(best_mean - y_target)
+
+    selected_solutions.append(best_sol)
+    selected_means.append(best_mean)
+    selected_pred_sds.append(best_sd)
+    selected_costs.append(best_cost)
+    selected_target_errors.append(best_err)
+
+selected_solutions = np.array(selected_solutions)
+selected_means = np.array(selected_means)
+selected_pred_sds = np.array(selected_pred_sds)
+selected_costs = np.array(selected_costs)
+selected_target_errors = np.array(selected_target_errors)
+selection_status = np.array(selection_status)
+
+print(f"Replications with at least one Pareto solution within tolerance ±{target_tol}: "
+      f"{np.sum(selection_status == 'within_tolerance')} / {n_iterations}")
+
+# ============================================================
+# 11. NUMERICAL SUMMARIES
+# ============================================================
+
+def mean_and_se(arr):
+    arr = np.asarray(arr)
+    return np.mean(arr), np.std(arr, ddof=1) / np.sqrt(len(arr))
+
+mean_pred, se_pred = mean_and_se(selected_means)
+mean_sd, se_sd = mean_and_se(selected_pred_sds)
+mean_cost, se_cost = mean_and_se(selected_costs)
+mean_err, se_err = mean_and_se(selected_target_errors)
+
+print(f"Mean predicted response = {mean_pred:.6f}")
+print(f"SE predicted response   = {se_pred:.6f}")
+print(f"Mean predicted SD       = {mean_sd:.6f}")
+print(f"SE predicted SD         = {se_sd:.6f}")
+print(f"Mean cost score         = {mean_cost:.6f}")
+print(f"SE cost score           = {se_cost:.6f}")
+print(f"Mean |pred-target|      = {mean_err:.6f}")
+print(f"SE |pred-target|        = {se_err:.6f}")
+
+# ============================================================
+# 12. PLOTS
+# ============================================================
+
+# Plot A: Cost vs predicted response
+plt.figure(figsize=(9, 7))
+plt.scatter(selected_costs, selected_means, alpha=0.8, edgecolors='k')
+plt.axhline(y=y_target, color='r', linestyle='--', label=f'Target = {y_target}')
+#plt.axhline(y=y_target - target_tol, color='gray', linestyle=':', label=f'Tolerance = ±{target_tol}')
+#plt.axhline(y=y_target + target_tol, color='gray', linestyle=':')
+plt.xlabel("Cost score of proposed solution", fontsize=16, labelpad=12)
+plt.ylabel("Predicted value of proposed solution", fontsize=16, labelpad=12)
+plt.tick_params(axis='both', which='major', labelsize=16, pad=12)
+plt.legend(fontsize=12)
+plt.grid(False)
+plt.show()
+
+# Plot B: Cost across replications
+plt.figure(figsize=(9, 7))
+plt.scatter(np.arange(len(selected_costs)), selected_costs, alpha=0.8, edgecolors='k')
+plt.xlabel("Replication", fontsize=16, labelpad=12)
+plt.ylabel("Cost score of proposed solution", fontsize=16, labelpad=12)
+plt.tick_params(axis='both', which='major', labelsize=16, pad=12)
+plt.grid(False)
+plt.show()
+
+# Plot C: Absolute target error vs cost
+plt.figure(figsize=(9, 7))
+plt.scatter(selected_costs, selected_target_errors, alpha=0.8, edgecolors='k')
+plt.axhline(y=target_tol, color='r', linestyle='--', label=f'Tolerance = {target_tol}')
+plt.xlabel("Cost score of proposed solution", fontsize=16, labelpad=12)
+plt.ylabel(r"$|\hat{\mu}(x)-y^*|$", fontsize=16, labelpad=12)
+plt.tick_params(axis='both', which='major', labelsize=16, pad=12)
+plt.legend(fontsize=12)
+plt.grid(False)
+plt.show()
+
+# Plot D: Pareto front from first replication
+plt.figure(figsize=(9, 7))
+plt.scatter(pareto_objectives_all[0][:, 1], pareto_objectives_all[0][:, 0], alpha=0.8, edgecolors='k')
+plt.xlabel("Cost score", fontsize=16, labelpad=12)
+plt.ylabel(r"$(\hat{\mu}(x)-y^*)^2$", fontsize=16, labelpad=12)
+plt.tick_params(axis='both', which='major', labelsize=16, pad=12)
+plt.grid(False)
+plt.show()
+
+# ============================================================
+# 13. PAIRPLOT OF SELECTED SOLUTIONS
+# ============================================================
+
+import seaborn as sns
+
+scaled_feature_names = [f"x{i+1}" for i in range(selected_solutions.shape[1])]
+df_best_solutions = pd.DataFrame(selected_solutions, columns=scaled_feature_names)
+
+g = sns.pairplot(df_best_solutions, diag_kind="hist", corner=True)
+for ax in g.axes.flatten():
+    if ax is not None:
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+plt.suptitle("Pairwise Scatter Plots of Cost-Based Selected Solutions", y=1.02, fontsize=16)
+plt.show()
+
+# ============================================================
+# 14. CONVERT TO ORIGINAL SCALE
+# ============================================================
+
+orig_path = Path("/content/drug loading data original scale - EE New.xlsx")
+orig_df = pd.read_excel(orig_path)
+
+orig_feature_cols = [
+    "Crucumin Solubility",
+    "Dipole Moment",
+    "Viscosity",
+    "Dielectric constants",
+    "Hildebrand Solubility Parameters",
+    "Polarity",
+]
+
+col_min = orig_df[orig_feature_cols].min().to_numpy()
+col_max = orig_df[orig_feature_cols].max().to_numpy()
+
+def inverse_min_max(x_scaled, vmin=col_min, vmax=col_max):
+    x_scaled = np.asarray(x_scaled, dtype=float)
+    return x_scaled * (vmax - vmin) + vmin
+
+best_solution_orig = inverse_min_max(selected_solutions[0])
+
+best_solution_df = pd.DataFrame(
+    best_solution_orig.reshape(1, -1),
+    columns=orig_feature_cols,
+    index=["Best solution (original scale)"]
+)
+
+print("\nOne selected solution in original units:")
+print(best_solution_df.round(4))
+
+# ============================================================
+# 15. SAVE RESULTS
+# ============================================================
+
+results_scaled_df = pd.DataFrame(selected_solutions, columns=orig_feature_cols)
+results_scaled_df["predicted_EE"] = selected_means
+results_scaled_df["predicted_sd"] = selected_pred_sds
+results_scaled_df["cost_score"] = selected_costs
+results_scaled_df["abs_target_error"] = selected_target_errors
+results_scaled_df["selection_status"] = selection_status
+results_scaled_df.to_csv("dataset1_multiobjective_cost_results_scaled.csv", index=False)
+
+results_orig_df = pd.DataFrame(
+    inverse_min_max(selected_solutions),
+    columns=orig_feature_cols
+)
+results_orig_df["predicted_EE"] = selected_means
+results_orig_df["predicted_sd"] = selected_pred_sds
+results_orig_df["cost_score"] = selected_costs
+results_orig_df["abs_target_error"] = selected_target_errors
+results_orig_df["selection_status"] = selection_status
+results_orig_df.to_csv("dataset1_multiobjective_cost_results_original_scale.csv", index=False)
+
+end_time = time.time()
+total_time = end_time - start_time
+print(f"\nTotal optimization time: {total_time:.3f} seconds")
+
+# Plot A: Cost vs predicted response
+plt.figure(figsize=(9, 7))
+plt.scatter(selected_costs, selected_means, alpha=0.8, edgecolors='k')
+plt.axhline(y=y_target, color='r', linestyle='--', label=f'Target = {y_target}')
+#plt.axhline(y=y_target - target_tol, color='gray', linestyle=':', label=f'Tolerance = ±{target_tol}')
+#plt.axhline(y=y_target + target_tol, color='gray', linestyle=':')
+plt.xlabel("Cost score of proposed solution", fontsize=16, labelpad=12)
+plt.ylabel("Predicted value of proposed solution", fontsize=16, labelpad=12)
+plt.ylim(14.8,15.2)
+plt.xlim(0.4,2.5)
+plt.tick_params(axis='both', which='major', labelsize=16, pad=12)
+plt.legend(fontsize=12)
+plt.grid(False)
+plt.show()
+
+plt.figure(figsize=(9, 7))
+plt.scatter(selected_costs, selected_means, alpha=0.8, edgecolors='k')
+plt.axhline(y=y_target, color='r', linestyle='--', label=f'Target = {y_target}')
+#plt.axhline(y=y_target - target_tol, color='gray', linestyle=':', label=f'Tolerance = ±{target_tol}')
+#plt.axhline(y=y_target + target_tol, color='gray', linestyle=':')
+plt.xlabel("Cost score of proposed solution", fontsize=16, labelpad=12)
+plt.ylabel("Predicted value of proposed solution", fontsize=16, labelpad=12)
+plt.xlim(0.5,2.5)
+plt.tick_params(axis='both', which='major', labelsize=16, pad=12)
+plt.legend(fontsize=12)
+plt.grid(False)
+plt.show()
